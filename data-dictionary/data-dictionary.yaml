@@ -19,7 +19,7 @@ metadata:
   version: 0.1.0
   companion_repo: fema-ffrd/inland-consequences (SPHERE core schemas)
   storage_tiers: [postgres, iceberg, icechunk]
-  domains: [inventory, attribute_uncertainty, hazard_linkage, ddf, realization_results, provenance]
+  domains: [inventory, attribute_uncertainty, hazard_linkage, ddf, realization_results, provenance, exports]
 
 # -----------------------------------------------------------------------------
 # ENUMERATIONS
@@ -77,10 +77,161 @@ enums:
     - calibration
   entity_type:
     - buildings
-    - attribute_distributions
-    - foundation_pmf
+    - uncertainty_spec       # replaces attribute_distributions + foundation_pmf
+    - uncertainty_correlation
     - ddf_library
     - events
+    - asset                  # ADR-versioning: stable identity
+    - asset_revision         # ADR-versioning: per-branch revision snapshot
+    - inventory_branch       # ADR-versioning: named branch of an inventory
+    - distribution_registry  # ADR-distribution-registry: parametric family contract
+    - geometries             # ADR-geometry: geometry-class revision
+    - export_contract        # ADR-exports: versioned export-contract object
+    - source_registry        # ADR-restricted-sources: classification + steward for every referenced source
+    - component_connection   # ADR-citygml-profile: typed component-to-component edge
+    - generics               # ADR-generics: generalized controlled-vocabulary registry
+  asset_type:                # ADR-versioning: extensible via Prompt 8A (generics)
+    - building
+    - component
+    - virtual                # forward-compat for future asset kinds
+  branch_status:
+    - open
+    - merged
+    - abandoned
+  change_kind:
+    - attribute_edit
+    - geometry_move
+    - add
+    - delete
+    - metadata
+  uncertainty_kind:
+    - continuous
+    - categorical
+    - deterministic
+  uncertainty_scope:
+    - building_specific
+    - class_level
+    - regional
+    - shared
+  uncertainty_consumer_type: # discriminator for uncertainty_ref.consumer_type
+    - buildings
+    - building_components
+    - ddf_uncertainty
+    - hazard_links
+    - virtual                # placeholder for future consumers (e.g. building value)
+  correlation_kind:
+    - conditional
+    - correlation
+    - independent
+  distribution_family_kind:  # ADR-distribution-registry
+    - continuous
+    - discrete
+    - empirical
+  distribution_support_type: # ADR-distribution-registry
+    - real
+    - positive
+    - unit_interval
+    - bounded
+    - integer_nonneg
+    - empirical
+  sampler_backend:           # ADR-distribution-registry
+    - scipy
+    - numpy
+    - custom
+  distribution_family_status:
+    - active
+    - deprecated
+  agent_type:
+    - person
+    - organization
+    - software
+  activity_type:
+    - import                # ingesting an external record as a source_observation
+    - fit                   # fitting a distribution / PMF from observations
+    - impute                # filling a missing value with a class/regional default
+    - override              # manual analyst edit
+    - derive                # computed from other adopted values
+    - calibrate             # tuning against a validation basin / observed loss
+  adopted_entity_type:      # discriminator for adopted_value_link (polymorphic parent)
+    - uncertainty_spec      # replaces attribute_distributions + foundation_pmf (ADR-uncertainty)
+    - ddf_uncertainty
+    - hazard_links
+    - geometries            # ADR-geometry: geometry adoption (relocation, footprint choice)
+  observation_role:
+    - primary
+    - supporting
+    - contradictory
+  geometry_role:             # ADR-geometry: compact LOD-like tag (not CityGML LOD0-4)
+    - point
+    - footprint
+    - envelope_3d            # reserved; not populated in v0.1
+    - detailed_3d            # reserved; not populated in v0.1
+  geometry_purpose:          # ADR-geometry: why this representation exists
+    - computation
+    - qc
+    - hazard_sampling
+    - display
+    - future_export
+  export_product_kind:       # ADR-exports: shape of the emitted artifact
+    - deterministic
+    - distribution_parameters
+    - pre_sampled_realizations
+  export_contract_status:    # ADR-exports
+    - active
+    - deprecated
+  export_status:             # ADR-exports: emitted-product lifecycle
+    - queued
+    - running
+    - success
+    - failed
+  export_access_level:       # ADR-exports (ties to ADR-restricted-sources, Prompt 6)
+    - public
+    - internal
+    - restricted
+  lossiness_reason:          # ADR-exports: why a canonical row was dropped from an export
+    - not_selected_for_export
+    - alternative_representation
+    - superseded_by_default
+    - redacted_restricted
+    - out_of_scope_for_contract
+    - collapsed_to_central_estimate
+  lossiness_entity_type:     # ADR-exports: discriminator for the polymorphic discarded_entity
+    - geometries
+    - uncertainty_spec
+    - building_components
+    - ddf_uncertainty
+    - hazard_links
+    - uncertainty_ref
+    - source_observation     # ADR-restricted-sources: discarded restricted-derived observation
+  access_classification:     # ADR-restricted-sources: per-source classification (policy surface)
+    - public
+    - internal
+    - restricted
+  source_kind:               # ADR-restricted-sources: taxonomy of source datasets
+    - national_inventory
+    - class_default
+    - field_survey
+    - remote_sensing
+    - commercial_parcel
+    - tribal
+    - proprietary
+    - agency_restricted
+    - other
+  connection_kind:           # ADR-citygml-profile: typed component-to-component edge
+    - supports
+    - contains
+    - adjacent_to
+    - attached_to
+  generic_kind:              # ADR-generics: superclass discriminator for the vocabulary registry
+    - building_component
+    - infrastructure_component   # reserved; no subclass table in v0.1
+    - uncertainty_class          # reserved; no subclass table in v0.1
+    - future_asset_kind          # explicit escape hatch
+  damage_relevance:          # ADR-generics: how a building-component generic participates in loss
+    - primary
+    - secondary
+    - contents_only
+    - inventory_only
 
 # -----------------------------------------------------------------------------
 # DOMAIN A — INVENTORY  (coverage of building inventory / components)
@@ -92,14 +243,17 @@ tables:
     storage: postgres
     grain: One row per structure.
     description: >
-      Anchor structure inventory, sourced from NSI / HAZUS. Holds identity,
-      geometry, and immutable/base attributes. Probabilistic attributes are NOT
-      stored here — they live in attribute_distributions and are resolved per
-      realization. Field aliases align to SPHERE core buildings schema.
+      Anchor structure inventory, sourced from NSI / HAZUS. Holds identity and
+      immutable/base attributes. Geometry is NOT stored here — ADR-geometry
+      promotes geometry to the `geometries` table, attached to asset_id. Every
+      buildings row must have at least one geometries row with role='point',
+      purpose='computation', is_selected_for_export=true on the current branch
+      (Prompt 11 rule). Probabilistic attributes live in uncertainty_spec and
+      are resolved per realization. Field aliases align to SPHERE core.
     columns:
-      - {name: building_id,        type: bigint,          pk: true,  nullable: false, description: Surrogate primary key.}
+      - {name: building_id,        type: bigint,          pk: true,  nullable: false, description: Surrogate primary key (current-head projection id; stable across revisions).}
+      - {name: asset_id,           type: bigint,          fk: asset.asset_id, nullable: false, description: 'Stable asset identity (ADR-versioning). Survives geometry / attribute / location changes; revisions materialize in asset_revision. Geometry attaches to asset_id, not building_id (ADR-geometry).'}
       - {name: fd_id,              type: bigint,          nullable: true,  description: Source NSI/HAZUS structure id (alias id/bldg_id/fd_id).}
-      - {name: geom,               type: geometry(Point,5070), nullable: false, description: Structure point location (CONUS Albers, EPSG:5070).}
       - {name: occupancy_type,     type: varchar(16),     nullable: false, description: Occupancy/occtype (e.g. RES1, COM1).}
       - {name: general_building_type, type: varchar(32),  nullable: true,  description: General construction class (bldgtype).}
       - {name: number_stories,     type: smallint,        nullable: true,  description: Story count (num_story).}
@@ -128,60 +282,267 @@ tables:
       - {name: replacement_cost, type: double,    nullable: true,  description: Component replacement value, USD (for component-level loss).}
       - {name: notes,          type: text,        nullable: true,  description: Free-text provenance / assumptions.}
 
+  component_connection:
+    domain: inventory
+    storage: postgres
+    grain: One row per typed edge between two building_components.
+    description: >
+      Typed component-to-component relationship (ADR-citygml-profile). Encodes
+      what CityGML captures natively for object relationships — but at the
+      minimum shape RQM needs today (roof supports wall supports foundation;
+      HVAC attached to structure; envelope contains HVAC). Both endpoints must
+      belong to the same building (Prompt 11 rule 2). Self-connections and
+      duplicate symmetric adjacent_to pairs are rejected. Component-fragility
+      weights, richer joint vocabularies, and cross-building topology are
+      deferred (see ADR §Deferrals). Connections are versioned so a component
+      swap does not rewrite history.
+    columns:
+      - {name: connection_id,      type: bigint,       pk: true, nullable: false, description: Surrogate primary key.}
+      - {name: from_component_id,  type: bigint,       fk: building_components.component_id, nullable: false, description: 'Source component. For asymmetric kinds (supports / contains / attached_to): the load-bearing / containing / anchor component. Rule: from_component_id != to_component_id.'}
+      - {name: to_component_id,    type: bigint,       fk: building_components.component_id, nullable: false, description: 'Target component. For supports: the component resting on `from`. For adjacent_to: the other side of the shared boundary (symmetric; single row per unordered pair, Prompt 11 rule 4).'}
+      - {name: connection_kind,    type: varchar(24),  nullable: false, description: 'supports | contains | adjacent_to | attached_to (enum connection_kind). supports/contains/attached_to are asymmetric; adjacent_to is symmetric.'}
+      - {name: description,        type: text,         nullable: true,  description: 'Free-text elaboration (e.g., "wood-frame roof sits on load-bearing wall, hurricane-strapped").'}
+      - {name: version_id,         type: bigint,       fk: versioning.version_id, nullable: false, description: Versioning row so a component swap does not rewrite connection history.}
+      - {name: created_at,         type: timestamptz,  nullable: false, description: Row insertion timestamp.}
+
   generics:
     domain: inventory
     storage: postgres
-    grain: One row per controlled-vocabulary asset/component type.
+    grain: One row per controlled-vocabulary asset/component type (superclass).
     description: >
-      Extensible "Generics" standard. Lets the same core model host non-building
-      inventories (transportation, utilities) in the future without redesign.
+      Generalized controlled-vocabulary superclass (ADR-generics). Every row
+      has exactly one matching subclass row in exactly one subclass table
+      selected by `kind` (SQL supertype/subtable pattern; identical to
+      uncertainty_spec). v0.1 populates the building_component kind only;
+      infrastructure_component / uncertainty_class / future_asset_kind are
+      reserved discriminator values with no subclass table yet (deferred,
+      declared to keep the extension path open — Prompt 11 rule 5 blocks
+      consumers from referencing them until a subclass lands).
     columns:
       - {name: generic_id,   type: bigint,      pk: true, nullable: false, description: Surrogate primary key.}
-      - {name: category,     type: varchar(32), nullable: false, description: Top-level class (Buildings, Transportation, Utilities...).}
-      - {name: subtype,      type: varchar(64), nullable: false, description: Specific type within the category.}
-      - {name: schema_ref,   type: varchar(128),nullable: true,  description: Pointer to the type-specific attribute schema.}
+      - {name: kind,         type: varchar(32), nullable: false, description: 'building_component | infrastructure_component | uncertainty_class | future_asset_kind (enum generic_kind). Discriminator for the subclass row (Prompt 11 rule 1).'}
+      - {name: category,     type: varchar(32), nullable: false, description: 'Top-level class (Buildings, Transportation, Utilities, ...). Consistency with kind enforced by Prompt 11 rule 3 (e.g., kind=building_component implies category=Buildings).'}
+      - {name: subtype,      type: varchar(64), nullable: false, description: Specific type within the category (e.g., LoadBearingWall, GableRoof).}
+      - {name: schema_ref,   type: varchar(128),nullable: true,  description: Pointer to the type-specific attribute schema (extensibility hook for RQM-10).}
+      - {name: description,  type: text,        nullable: true,  description: Free-text description of the type.}
+      - {name: version_id,   type: bigint,      fk: versioning.version_id, nullable: false, description: 'Version/lineage of this vocabulary entry. Vocabulary changes bump a new version rather than mutating in place, so historical exports remain reconstructable.'}
+      - {name: created_at,   type: timestamptz, nullable: false, description: Row insertion timestamp.}
+
+  generic_building_component:
+    domain: inventory
+    storage: postgres
+    grain: One row per building_component-kind generic (subclass).
+    description: >
+      Subclass of generics for kind='building_component' (ADR-generics). Holds
+      building-component-specific defaults that would be null for other kinds
+      (damage relevance, typical replacement-cost share). All columns except
+      generic_id are optional class defaults — the subclass exists to hold
+      building-component-relevant attributes without loading them onto the
+      superclass. Consumer: building_components.generic_id must resolve to a
+      generics row of kind='building_component' (Prompt 11 rule 2).
+    columns:
+      - {name: generic_id,                        type: bigint, pk: true, fk: generics.generic_id, nullable: false, description: 'FK+PK to generics (subtype pattern; same shape as uncertainty_spec subclasses).'}
+      - {name: damage_relevance,                  type: varchar(16), nullable: true, description: 'primary | secondary | contents_only | inventory_only (enum damage_relevance). How this component kind participates in loss aggregation.'}
+      - {name: typical_replacement_cost_fraction, type: real,        nullable: true, description: "Component's typical share of building total replacement cost in [0,1] (Prompt 11 rule 6). Compiler fallback when building_components.replacement_cost is missing (ADR-exports imputation_policy)."}
+
+  # ---------------------------------------------------------------------------
+  # GEOMETRY AS ITS OWN CLASS  (ADR-geometry)
+  # Promotes geometry off buildings.geom into a first-class entity attached to
+  # asset_id (per ADR-versioning pre-commitment). Supports multiple
+  # representations per asset (point + footprint + reserved 3D roles) AND
+  # multiple alternates at the same role (alt_group_key). Component-level
+  # geometry lands via optional component_id — the semantic hierarchy
+  # (asset -> component) is a real FK, not a polymorphic bridge. Reflects
+  # CityGML's coherent semantical-geometrical modeling principle at a
+  # lightweight level (no full LOD taxonomy in v0.1). Selection for the flat
+  # export is explicit (is_selected_for_export) rather than an implicit column.
+  # ---------------------------------------------------------------------------
+  geometries:
+    domain: inventory
+    storage: postgres
+    grain: One row per (asset or component, representation, alternate) geometric record.
+    description: >
+      First-class geometry registry. Each row represents one geometric
+      representation of an asset (or of a specific component of that asset).
+      Multiple rows per asset are expected — point + footprint + optional 3D,
+      plus alternates from different sources at the same role. Exactly one
+      row per (asset_id, purpose='computation') is selected for export at any
+      given branch/valid-time. Component-level attach is optional and
+      structurally consistent (Prompt 11 enforces that a component geometry's
+      asset_id matches its parent component's asset_id). Payload kind is
+      dictated by `role` (point / footprint / 3D). Revisions attach here, not
+      to buildings, so a geometry_move never forces a non-geometric revision.
+    columns:
+      - {name: geometry_id,          type: bigint,       pk: true, nullable: false, description: Surrogate primary key.}
+      - {name: asset_id,             type: bigint,       fk: asset.asset_id, nullable: false, description: 'Stable asset this geometry represents (ADR-versioning pre-commitment). Required — every geometry rolls up to an asset.'}
+      - {name: component_id,         type: bigint,       fk: building_components.component_id, nullable: true, description: 'Optional component this geometry represents (foundation, HVAC, roof, ...). Null when the geometry represents the asset itself. Coherent semantical-geometrical rule: when non-null, the component''s buildings.asset_id must equal this row''s asset_id (Prompt 11).'}
+      - {name: role,                 type: varchar(24),  nullable: false, description: 'point | footprint | envelope_3d | detailed_3d (enum geometry_role). RQM''s compact LOD-like tag; envelope_3d / detailed_3d reserved but not populated in v0.1.'}
+      - {name: crs,                  type: varchar(24),  nullable: false, description: 'Coordinate reference system (e.g., EPSG:5070). Per-row so alternates from different sources preserve their native CRS.'}
+      - {name: geom,                 type: geometry,     nullable: false, description: 'PostGIS geometry payload. Shape dictated by role: point -> Point; footprint -> Polygon/MultiPolygon; 3D roles -> PolyhedralSurface/TIN when populated.'}
+      - {name: purpose,              type: varchar(24),  nullable: false, description: 'computation | qc | hazard_sampling | display | future_export (enum geometry_purpose). Encodes why this representation exists.'}
+      - {name: is_selected_for_export, type: boolean,    nullable: false, description: 'True iff this row is the export-contract-selected representation for its (asset_id, purpose=computation) group on the current branch. Exactly one true per group (Prompt 11 rule 2).'}
+      - {name: alt_group_key,        type: varchar(64),  nullable: true,  description: 'Optional group key clustering alternates at the SAME (asset_id, role) — e.g., two competing footprints from different sources share one key. Rows sharing a key must share (asset_id, role) (Prompt 11 rule 4).'}
+      - {name: source_ref,           type: varchar(128), nullable: true,  description: 'Source dataset / observation reference (e.g., NSI-2024.1, MicrosoftBuildings-2022). Full provenance flows via adopted_value_link with adopted_entity_type=geometries.'}
+      - {name: validity_version_id,  type: bigint,       fk: versioning.version_id, nullable: false, description: 'Bitemporal versioning row (ADR-versioning) for this geometry revision. A geometry_move produces a new row + a revision_log entry keyed to this version_id.'}
+      - {name: created_at,           type: timestamptz,  nullable: false, description: Row insertion timestamp.}
 
 # -----------------------------------------------------------------------------
 # DOMAIN B — ATTRIBUTE UNCERTAINTY  (uncertainty quantification, core paradigm)
+# ADR-uncertainty: generalized superclass with continuous / categorical /
+# deterministic children, made shareable via uncertainty_ref, with correlations
+# as a first-class relationship. Replaces the former attribute_distributions
+# and foundation_pmf tables.
 # -----------------------------------------------------------------------------
-  attribute_distributions:
+  uncertainty_spec:
     domain: attribute_uncertainty
     storage: postgres
-    grain: One row per (building/component, attribute, version).
+    grain: One row per shareable uncertainty specification (any kind).
     description: >
-      The heart of the probabilistic model. Replaces a scalar attribute value
-      with a typed, versioned distribution SPECIFICATION. Covers probabilistic
-      first-floor height, the "shuffled" foundation type, and any other
-      uncertain building attribute. Sampling engine reads these rows to draw
-      per-realization values.
+      Superclass for every uncertainty specification in the model. Identity,
+      scope, kind, validity, units, version. Every uncertainty_spec has exactly
+      one row in exactly one subclass table (uncertainty_spec_continuous |
+      uncertainty_spec_categorical | uncertainty_spec_deterministic) selected
+      by `kind`. Consumers reference a spec via uncertainty_ref; a single spec
+      may be reused by many consumers (class-level / regional / shared) or by
+      exactly one (building-specific).
     columns:
-      - {name: dist_id,        type: bigint,       pk: true,  nullable: false, description: Surrogate primary key.}
-      - {name: building_id,    type: bigint,       fk: buildings.building_id, nullable: false, description: Structure the distribution applies to.}
-      - {name: component_id,   type: bigint,       fk: building_components.component_id, nullable: true, description: Optional component scope (null = whole building).}
-      - {name: attribute_name, type: varchar(48),  nullable: false, description: Attribute described, e.g. foundation_type, first_floor_height.}
-      - {name: dist_family,    type: varchar(24),  nullable: false, description: Distribution family (enum dist_family).}
-      - {name: parameters,     type: jsonb,        nullable: false, description: 'Family params, e.g. {"mu":1.5,"sigma":0.4,"lower":0} or PMF {"Slab":0.6,"Crawl":0.3}.'}
-      - {name: conditioning,   type: jsonb,        nullable: true,  description: 'Dependencies, e.g. FFH conditioned on sampled foundation_class.'}
-      - {name: units,          type: varchar(16),  nullable: true,  description: Physical units of the sampled quantity (ft, m, class).}
-      - {name: source,         type: varchar(128), nullable: true,  description: Data source / method used to fit the distribution.}
-      - {name: confidence,     type: real,         nullable: true,  description: "Analyst/model confidence score in [0,1]."}
-      - {name: version_id,     type: bigint,       fk: versioning.version_id, nullable: false, description: Version/lineage of this distribution spec.}
+      - {name: uncertainty_spec_id, type: bigint,     pk: true, nullable: false, description: Surrogate primary key.}
+      - {name: kind,           type: varchar(16),    nullable: false, description: 'continuous | categorical | deterministic (enum uncertainty_kind). Discriminator for the subclass row.'}
+      - {name: attribute_name, type: varchar(48),    nullable: false, description: 'Attribute this spec describes semantically (e.g., first_floor_height, foundation_class).'}
+      - {name: units,          type: varchar(16),    nullable: true,  description: Physical units of the sampled quantity (ft, m, class).}
+      - {name: scope,          type: varchar(24),    nullable: false, description: 'building_specific | class_level | regional | shared (enum uncertainty_scope). Documentation/QA; actual sharing is expressed by uncertainty_ref rows pointing at this spec.'}
+      - {name: scope_ref,      type: varchar(64),    nullable: true,  description: 'Class label / region key when scope != building_specific (e.g., "RES1", "AlleghenyCounty").'}
+      - {name: fitting_method, type: varchar(64),    nullable: true,  description: 'Method used to derive the spec (e.g., MLE, class-default, expert-elicitation).'}
+      - {name: validity_from,  type: timestamptz,    nullable: true,  description: Real-world start of validity (valid-time).}
+      - {name: validity_to,    type: timestamptz,    nullable: true,  description: Real-world end of validity (null = open-ended).}
+      - {name: description,    type: text,           nullable: true,  description: Free-text description of the spec.}
+      - {name: version_id,     type: bigint,         fk: versioning.version_id, nullable: false, description: Version/lineage of this spec.}
+      - {name: created_at,     type: timestamptz,    nullable: false, description: Row insertion timestamp.}
 
-  foundation_pmf:
+  uncertainty_spec_continuous:
     domain: attribute_uncertainty
     storage: postgres
-    grain: One row per (building, foundation_class) probability-mass entry.
+    grain: One row per continuous uncertainty spec.
     description: >
-      Explicit representation of the "shuffled" foundation type. Stores the
-      probability mass per class plus the shuffle/sampling policy so that draws
-      are reproducible and consistent across a community run.
+      Continuous subtype of uncertainty_spec. Points at the distribution
+      registry (ADR-distribution-registry) for family + parameterization
+      contract + compute backend. Supports parametric families (normal,
+      lognormal, uniform, triangular, ...) and empirical ensembles via an
+      optional ensemble reference.
     columns:
-      - {name: pmf_id,          type: bigint,      pk: true, nullable: false, description: Surrogate primary key.}
-      - {name: building_id,     type: bigint,      fk: buildings.building_id, nullable: false, description: Structure this PMF applies to.}
-      - {name: foundation_class,type: varchar(24), nullable: false, description: Foundation class (enum foundation_class).}
-      - {name: probability,     type: real,        nullable: false, description: Probability mass for the class; sums to 1 per building.}
-      - {name: shuffle_policy,  type: varchar(24), nullable: false, description: 'independent | region_correlated | inventory_locked (enum shuffle_policy).'}
-      - {name: version_id,      type: bigint,      fk: versioning.version_id, nullable: false, description: Version of this PMF.}
+      - {name: uncertainty_spec_id, type: bigint,   pk: true, fk: uncertainty_spec.uncertainty_spec_id, nullable: false, description: 'FK+PK to uncertainty_spec (subtype pattern).'}
+      - {name: dist_family,     type: varchar(48), fk: distribution_registry.family_name, nullable: false, description: 'Distribution family name. FK into distribution_registry (ADR-distribution-registry) — parameter contract and compute backend are enforced there. `parameters` must satisfy the referenced family_name.parameter_contract.'}
+      - {name: parameters,      type: jsonb,       nullable: false, description: 'Family parameters honoring the registry contract (e.g., {"mu":1.5,"sigma":0.4}).'}
+      - {name: support_type,    type: varchar(16), nullable: true,  description: 'real | positive | bounded | discrete (documents parameter support).'}
+      - {name: lower_bound,     type: real,        nullable: true,  description: Optional lower support bound.}
+      - {name: upper_bound,     type: real,        nullable: true,  description: Optional upper support bound.}
+      - {name: empirical_ensemble_ref, type: varchar(256), nullable: true, description: 'URI to an empirical ensemble (e.g., an Icechunk/Iceberg reference) when dist_family="empirical".'}
+
+  uncertainty_spec_categorical:
+    domain: attribute_uncertainty
+    storage: postgres
+    grain: One row per categorical uncertainty spec.
+    description: >
+      Categorical subtype of uncertainty_spec. Holds the PMF as a single jsonb
+      object (category → probability) and the shuffle_policy that governs
+      reproducibility and cross-building correlation. Replaces the former
+      per-(building, class) foundation_pmf rows; the whole PMF is one spec.
+    columns:
+      - {name: uncertainty_spec_id, type: bigint,   pk: true, fk: uncertainty_spec.uncertainty_spec_id, nullable: false, description: 'FK+PK to uncertainty_spec (subtype pattern).'}
+      - {name: categories_pmf,   type: jsonb,       nullable: false, description: 'PMF as {"Slab":0.6,"CrawlSpace":0.3,"Basement":0.1}; must sum to 1.0 (±1e-6).'}
+      - {name: shuffle_policy,   type: varchar(24), nullable: true,  description: 'independent | region_correlated | inventory_locked (enum shuffle_policy); null = default independent.'}
+
+  uncertainty_spec_deterministic:
+    domain: attribute_uncertainty
+    storage: postgres
+    grain: One row per deterministic (degenerate) uncertainty spec.
+    description: >
+      Deterministic subtype of uncertainty_spec. Preserves the locked invariant
+      that a deterministic value is a valid degenerate form of an uncertainty
+      spec, not a special case handled elsewhere. Downstream samplers treat
+      it as a degenerate draw.
+    columns:
+      - {name: uncertainty_spec_id, type: bigint,   pk: true, fk: uncertainty_spec.uncertainty_spec_id, nullable: false, description: 'FK+PK to uncertainty_spec (subtype pattern).'}
+      - {name: value,            type: jsonb,       nullable: false, description: 'Pinned value; scalar or category, JSON-encoded (e.g., 2, "Slab").'}
+      - {name: value_type,       type: varchar(16), nullable: false, description: 'scalar | category — what kind of value is pinned.'}
+
+  uncertainty_ref:
+    domain: attribute_uncertainty
+    storage: postgres
+    grain: One row per (consumer, attribute) binding to an uncertainty_spec.
+    description: >
+      Polymorphic bridge: "consumer X uses spec Y for attribute Z." A single
+      uncertainty_spec may be referenced by many consumers (class/regional
+      /shared) or by exactly one (building-specific). Consumer parent uses the
+      discriminator-on-relationship pattern via consumer_type; the paired
+      consumer_id resolves in the table named by consumer_type (validated in
+      app/CI, same as adopted_value_link).
+    columns:
+      - {name: ref_id,           type: bigint,      pk: true, nullable: false, description: Surrogate primary key.}
+      - {name: consumer_type,    type: varchar(32), nullable: false, description: 'Consumer entity kind (enum uncertainty_consumer_type). Discriminator for the polymorphic consumer.'}
+      - {name: consumer_id,      type: bigint,      nullable: false, description: 'Id in the table named by consumer_type. No hard FK (target varies); validated in application/CI.'}
+      - {name: attribute_name,   type: varchar(48), nullable: false, description: 'Attribute for which this consumer uses this spec (matches uncertainty_spec.attribute_name).'}
+      - {name: uncertainty_spec_id, type: bigint,   fk: uncertainty_spec.uncertainty_spec_id, nullable: false, description: Spec being referenced.}
+      - {name: created_at,       type: timestamptz, nullable: false, description: Row insertion timestamp.}
+
+  uncertainty_correlation:
+    domain: attribute_uncertainty
+    storage: postgres
+    grain: One row per pairwise coupling between two uncertainty specs.
+    description: >
+      First-class representation of dependencies between two uncertainty
+      specs. Supports conditional (parameters of A depend on drawn value of
+      B), correlation (Pearson/Spearman coefficient between two continuous
+      specs), and independent (explicit declaration of no coupling, used in
+      QA). Full copula / multivariate joint modeling is deferred.
+    columns:
+      - {name: correlation_id,   type: bigint,      pk: true, nullable: false, description: Surrogate primary key.}
+      - {name: spec_a_id,        type: bigint,      fk: uncertainty_spec.uncertainty_spec_id, nullable: false, description: Dependent spec (its draw depends on spec_b or is correlated with it).}
+      - {name: spec_b_id,        type: bigint,      fk: uncertainty_spec.uncertainty_spec_id, nullable: false, description: Conditioning / correlated spec.}
+      - {name: kind,             type: varchar(16), nullable: false, description: 'conditional | correlation | independent (enum correlation_kind).'}
+      - {name: specification,    type: jsonb,       nullable: true,  description: 'Kind-dependent payload. conditional: {category_of_b: params_for_a}. correlation: {rho: 0.7, method: "pearson"}. independent: null.'}
+      - {name: description,      type: text,        nullable: true,  description: Free-text description of the dependence.}
+      - {name: version_id,       type: bigint,      fk: versioning.version_id, nullable: false, description: Version/lineage of this correlation.}
+
+  # ---------------------------------------------------------------------------
+  # DISTRIBUTION RENDERING & COMPUTE REGISTRY  (ADR-distribution-registry)
+  # Central contract for every parametric distribution family referenced by
+  # uncertainty_spec_continuous, hazard_links, and ddf_uncertainty. Declares
+  # required parameter names + JSON types + constraints (parameter_contract)
+  # and pins the canonical sampler / PDF / CDF / PPF callables. `family_name`
+  # is the natural PK — deliberate deviation from surrogate-PK convention for
+  # readability at reference sites (dist_family='lognormal' beats id=7).
+  # ---------------------------------------------------------------------------
+  distribution_registry:
+    domain: attribute_uncertainty
+    storage: postgres
+    grain: One row per supported parametric distribution family.
+    description: >
+      Compute + rendering contract for every parametric distribution family
+      referenced elsewhere in the model. Each row declares the required
+      parameters (parameter_contract), the support semantics, and the canonical
+      compute backend (sampler/PDF/CDF/PPF callables). Prompt 11 enforces that
+      every consumer's parameters jsonb satisfies the referenced family's
+      contract. categorical and deterministic uncertainty do not live here —
+      they use structural columns on uncertainty_spec_categorical /
+      uncertainty_spec_deterministic instead of parametric jsonb.
+    columns:
+      - {name: family_name,        type: varchar(48),  pk: true, nullable: false, description: 'Family identifier used by consumers (e.g., lognormal, truncated_normal, empirical). Natural key; matches uncertainty_spec_continuous.dist_family / hazard_links.depth_dist_family / ddf_uncertainty.dist_family.'}
+      - {name: family_kind,        type: varchar(16),  nullable: false, description: 'continuous | discrete | empirical (enum distribution_family_kind).'}
+      - {name: parameter_contract, type: jsonb,        nullable: false, description: 'Array of {name, json_type, required, constraint, description}. Canonical parameter names for the family. Empty array iff family_kind=empirical.'}
+      - {name: support_type,       type: varchar(16),  nullable: false, description: 'real | positive | unit_interval | bounded | integer_nonneg | empirical (enum distribution_support_type).'}
+      - {name: default_lower_bound,type: real,         nullable: true,  description: Support hint (optional; overridable per-spec).}
+      - {name: default_upper_bound,type: real,         nullable: true,  description: Support hint (optional; overridable per-spec).}
+      - {name: sampler_backend,    type: varchar(16),  nullable: false, description: 'scipy | numpy | custom (enum sampler_backend).'}
+      - {name: sampler_ref,        type: varchar(128), nullable: false, description: 'Canonical callable reference for sampling (e.g., scipy.stats.lognorm.rvs).'}
+      - {name: pdf_ref,            type: varchar(128), nullable: true,  description: 'Canonical PDF callable (nullable when backend does not expose one).'}
+      - {name: cdf_ref,            type: varchar(128), nullable: true,  description: 'Canonical CDF callable (nullable when backend does not expose one).'}
+      - {name: ppf_ref,            type: varchar(128), nullable: true,  description: 'Canonical inverse-CDF / percentile callable (nullable when backend does not expose one).'}
+      - {name: status,             type: varchar(16),  nullable: false, description: 'active | deprecated (enum distribution_family_status). Consumers may only reference active families.'}
+      - {name: version_id,         type: bigint,       fk: versioning.version_id, nullable: false, description: Version/lineage of the family contract (contract changes bump semver).}
+      - {name: description,        type: text,         nullable: true,  description: Free-text description of the family and its use.}
+      - {name: citations,          type: text,         nullable: true,  description: Optional references / citations for the family.}
+      - {name: created_at,         type: timestamptz,  nullable: false, description: Row insertion timestamp.}
 
 # -----------------------------------------------------------------------------
 # DOMAIN C — HAZARD LINKAGE  (probabilistic flood depth)
@@ -224,7 +585,7 @@ tables:
       - {name: depth_grid_uri,   type: varchar(256), nullable: false, description: Icechunk repo/branch URI for the depth field (versioned).}
       - {name: velocity_grid_uri,type: varchar(256), nullable: true,  description: Optional velocity field URI.}
       - {name: duration_grid_uri,type: varchar(256), nullable: true,  description: Optional duration field URI.}
-      - {name: depth_dist_family,type: varchar(24),  nullable: false, description: Distribution family of depth-in-structure uncertainty.}
+      - {name: depth_dist_family,type: varchar(48),  fk: distribution_registry.family_name, nullable: false, description: 'Distribution family of depth-in-structure uncertainty. FK into distribution_registry (ADR-distribution-registry); `depth_parameters` must satisfy its parameter contract.'}
       - {name: depth_parameters, type: jsonb,        nullable: false, description: 'Params of the depth-in-structure distribution at this point.'}
       - {name: grid_version,     type: varchar(64),  nullable: false, description: Icechunk snapshot/commit id for reproducibility.}
 
@@ -252,21 +613,29 @@ tables:
   ddf_uncertainty:
     domain: ddf
     storage: postgres
-    grain: One row per (ddf, depth) percentile envelope.
+    grain: One row per (ddf, depth) damage-ratio distribution.
     description: >
-      Makes the DDF itself a distribution. Stores per-depth central tendency and
-      percentile spread so a realization can draw a DDF percentile rather than
-      using a single mean curve.
+      Makes the DDF itself a distribution (ADR-ddf-uncertainty). Each row
+      publishes a canonical mean damage ratio at this depth and, optionally,
+      a reference to an uncertainty_spec that authoritatively describes the
+      spread around that mean. When spread_spec_id is set, the p10/p50/p90
+      columns are a rendered cache from spec.ppf(q) — Prompt 11 rejects stale
+      caches. When spread_spec_id is null, the percentile columns are the
+      authoritative spread (legacy USACE / FIA / HAZUS envelope shape). When
+      both spread_spec_id AND percentile columns are null, the row is a
+      point DDF (mean only) — legal, flagged as diagnostic by Prompt 11.
+      Supersedes the inline dist_family/parameters columns from
+      ADR-distribution-registry (registry contract now applies indirectly via
+      uncertainty_spec_continuous.dist_family).
     columns:
-      - {name: ddf_unc_id,   type: bigint,  pk: true, nullable: false, description: Surrogate primary key.}
-      - {name: ddf_id,       type: bigint,  fk: ddf_library.ddf_id, nullable: false, description: Parent DDF.}
-      - {name: depth_ft,     type: real,    nullable: false, description: Flood depth relative to first floor, feet.}
-      - {name: damage_mean,  type: real,    nullable: false, description: "Mean damage ratio in [0,1] at this depth."}
-      - {name: damage_p10,   type: real,    nullable: true,  description: 10th percentile damage ratio.}
-      - {name: damage_p50,   type: real,    nullable: true,  description: Median damage ratio.}
-      - {name: damage_p90,   type: real,    nullable: true,  description: 90th percentile damage ratio.}
-      - {name: dist_family,  type: varchar(24), nullable: true, description: Optional parametric family of the damage-ratio spread.}
-      - {name: parameters,   type: jsonb,   nullable: true,  description: Optional parametric spread params at this depth.}
+      - {name: ddf_unc_id,     type: bigint,  pk: true, nullable: false, description: Surrogate primary key.}
+      - {name: ddf_id,         type: bigint,  fk: ddf_library.ddf_id, nullable: false, description: Parent DDF.}
+      - {name: depth_ft,       type: real,    nullable: false, description: Flood depth relative to first floor, feet.}
+      - {name: damage_mean,    type: real,    nullable: false, description: "Canonical mean damage ratio in [0,1] at this depth. Required inline — matches the shape of published USACE/FIA/HAZUS DDFs and is what mv_loss_summary.loss_mean reduces against. Uncertainty on damage_mean itself is out of scope (ADR-ddf-uncertainty §Deferred)."}
+      - {name: spread_spec_id, type: bigint,  fk: uncertainty_spec.uncertainty_spec_id, nullable: true, description: 'Authoritative uncertainty_spec for the damage-ratio spread at this depth (ADR-ddf-uncertainty). When set, describes the distribution around damage_mean; parameter contract flows through uncertainty_spec_continuous.dist_family → distribution_registry. Null for point DDFs or legacy percentile-only envelopes.'}
+      - {name: damage_p10,     type: real,    nullable: true,  description: '10th percentile damage ratio. Authoritative when spread_spec_id is null; rendered cache (spec.ppf(0.1)) when set — Prompt 11 rejects stale caches.'}
+      - {name: damage_p50,     type: real,    nullable: true,  description: 'Median damage ratio. Authoritative when spread_spec_id is null; rendered cache (spec.ppf(0.5)) when set.'}
+      - {name: damage_p90,     type: real,    nullable: true,  description: '90th percentile damage ratio. Authoritative when spread_spec_id is null; rendered cache (spec.ppf(0.9)) when set.'}
 
 # -----------------------------------------------------------------------------
 # DOMAIN E — REALIZATION & LOSS RESULTS  (ensemble scale)
@@ -370,16 +739,312 @@ tables:
   versioning:
     domain: provenance
     storage: postgres
-    grain: One row per versioned entity snapshot.
+    grain: One row per versioned entity snapshot (bitemporal).
     description: >
-      The "Versioning" standard applied to every distribution, PMF, DDF, and
-      inventory snapshot so downstream/third-party users can reference versions
-      and log extensions. Central lineage registry.
+      Central bitemporal lineage registry (ADR-versioning). Every versioned
+      entity — uncertainty spec, DDF, event, asset revision, branch head —
+      resolves through a version_id and inherits a valid-time interval
+      (real-world) and a record-time interval (knowledge). Bitemporal columns
+      apply only where change actually occurs (locked invariant); reference
+      tables and vocabularies leave valid_from/valid_to null. record_from is
+      non-null on any row referenced by an asset_revision; record_to is null
+      iff the row is the current record for its entity_ref.
     columns:
       - {name: version_id,   type: bigint,       pk: true, nullable: false, description: Surrogate primary key.}
       - {name: entity_type,  type: varchar(32),  nullable: false, description: 'Versioned entity kind (enum entity_type).'}
-      - {name: entity_ref,   type: varchar(64),  nullable: false, description: Natural/business key of the versioned entity.}
+      - {name: entity_ref,   type: varchar(64),  nullable: false, description: 'Natural/business key of the versioned entity (e.g., asset:42, uncertainty_spec:201).'}
       - {name: semver,       type: varchar(16),  nullable: false, description: Semantic version string (e.g. 1.2.0).}
       - {name: parent_version_id, type: bigint,  fk: versioning.version_id, nullable: true, description: Lineage pointer to prior version.}
-      - {name: author,       type: varchar(64),  nullable: true,  description: Author/owner of the version.}
-      - {name: created_at,   type: timestamptz,  nullable: false, description: Version creation timestamp.}
+      - {name: valid_from,   type: timestamptz,  nullable: true,  description: 'Real-world start of validity (valid-time). Null for reference tables that do not need bitemporality.'}
+      - {name: valid_to,     type: timestamptz,  nullable: true,  description: 'Real-world end of validity (valid-time). Null = open-ended.'}
+      - {name: record_from,  type: timestamptz,  nullable: true,  description: 'System time this assertion was recorded (record-time / transaction-time). Non-null when referenced by an asset_revision.'}
+      - {name: record_to,    type: timestamptz,  nullable: true,  description: 'System time this assertion was superseded. Null iff current record.'}
+      - {name: author,       type: varchar(64),  nullable: true,  description: Author/owner string (kept for readability; authoritative editor lives in revision_log.editor_agent_id).}
+      - {name: created_at,   type: timestamptz,  nullable: false, description: Row insertion timestamp.}
+
+  # ---------------------------------------------------------------------------
+  # IDENTITY / BRANCH / REVISION MODEL  (ADR-versioning)
+  # asset splits stable identity from revision-carrying attribute rows so a
+  # branch or bitemporal amend never forks the FK graph. buildings.asset_id is
+  # the projection anchor; downstream FKs to building_id logically resolve
+  # through it. asset_type is a discriminator hooked to Prompt 8A generics.
+  # ---------------------------------------------------------------------------
+  asset:
+    domain: provenance
+    storage: postgres
+    grain: One row per real-world asset identity (stable across all revisions).
+    description: >
+      Stable identity registry. asset_id survives every geometry, attribute,
+      and location change (locked invariant). Downstream FKs may point at
+      asset_id directly, or via buildings.building_id → buildings.asset_id.
+      Extensible via asset_type — today: building; tomorrow (Prompt 8A):
+      component, geometry, bridge, levee, virtual.
+    columns:
+      - {name: asset_id,             type: bigint,       pk: true, nullable: false, description: Surrogate stable identity.}
+      - {name: asset_type,           type: varchar(16),  nullable: false, description: 'building | component | geometry | virtual (enum asset_type). Hooks Prompt 8A generics generalization.'}
+      - {name: canonical_external_ref, type: varchar(128), nullable: true, description: 'Optional stable external identifier (e.g., NSI fd_id, cadastral parcel id) preserved across renames.'}
+      - {name: created_at,           type: timestamptz,  nullable: false, description: Identity registration timestamp.}
+
+  inventory_branch:
+    domain: provenance
+    storage: postgres
+    grain: One row per named branch of an inventory.
+    description: >
+      Named branch (main, scenario forks, calibration passes, hypothesis
+      explorations). Every asset_revision carries a branch_id; two reviewers
+      editing the same asset on different branches produce co-existing
+      revisions without conflict. Merging is recorded via
+      merged_into_branch_id; automatic three-way merge is deferred.
+    columns:
+      - {name: branch_id,            type: bigint,       pk: true, nullable: false, description: Surrogate primary key.}
+      - {name: name,                 type: varchar(96),  nullable: false, description: 'Human-readable branch name (e.g., main, calibration-2026Q3).'}
+      - {name: parent_branch_id,     type: bigint,       fk: inventory_branch.branch_id, nullable: true, description: 'Parent branch (null for main). No cycles allowed.'}
+      - {name: purpose,              type: varchar(64),  nullable: true,  description: 'Free text purpose (calibration | scenario | hypothesis | cleanup | ...).'}
+      - {name: created_by_agent_id,  type: bigint,       fk: prov_agent.agent_id, nullable: false, description: Agent that created the branch.}
+      - {name: created_at,           type: timestamptz,  nullable: false, description: Branch creation timestamp.}
+      - {name: status,               type: varchar(16),  nullable: false, description: 'open | merged | abandoned (enum branch_status).'}
+      - {name: merged_into_branch_id, type: bigint,      fk: inventory_branch.branch_id, nullable: true, description: 'Non-null only when status = merged; the branch this one merged back into.'}
+      - {name: merged_at,            type: timestamptz,  nullable: true,  description: 'Merge timestamp when status = merged.'}
+
+  asset_revision:
+    domain: provenance
+    storage: postgres
+    grain: One row per (asset, branch, versioning) revision.
+    description: >
+      Materializes a revision of an asset on a specific branch, tied to a
+      versioning row that carries the bitemporal quadruple. The "current head"
+      projection lives in the domain table (e.g., buildings); historical and
+      alternate-branch revisions live here and are reconstructable by view.
+      Uniqueness: exactly one revision per (asset, branch, valid_from).
+    columns:
+      - {name: revision_id,          type: bigint,       pk: true, nullable: false, description: Surrogate primary key.}
+      - {name: asset_id,             type: bigint,       fk: asset.asset_id, nullable: false, description: Stable asset identity this revision belongs to.}
+      - {name: branch_id,            type: bigint,       fk: inventory_branch.branch_id, nullable: false, description: Branch on which this revision was recorded.}
+      - {name: version_id,           type: bigint,       fk: versioning.version_id, nullable: false, description: Versioning row (bitemporal registry) for this revision.}
+      - {name: valid_from,           type: timestamptz,  nullable: false, description: Real-world start of this revision (denormalized from versioning for query convenience).}
+      - {name: valid_to,             type: timestamptz,  nullable: true,  description: Real-world end of this revision (null = open-ended on this branch).}
+      - {name: is_current,           type: boolean,      nullable: false, description: True iff this revision is the current head on its branch.}
+      - {name: created_at,           type: timestamptz,  nullable: false, description: Row insertion timestamp.}
+
+  revision_log:
+    domain: provenance
+    storage: postgres
+    grain: One row per structured change to a versioned entity.
+    description: >
+      Editor + reason + diff for each version bump. Complementary to
+      adopted_value_link (which records sources); this table records edits.
+      Together they answer "where did this value come from AND who changed it,
+      when, why." diff schema is recommended (path/before/after) but not
+      formalized — see Prompt 11.
+    columns:
+      - {name: log_id,               type: bigint,       pk: true, nullable: false, description: Surrogate primary key.}
+      - {name: version_id,           type: bigint,       fk: versioning.version_id, nullable: false, description: Versioning row this log entry produced.}
+      - {name: editor_agent_id,      type: bigint,       fk: prov_agent.agent_id, nullable: false, description: Agent responsible for this edit.}
+      - {name: change_kind,          type: varchar(24),  nullable: false, description: 'attribute_edit | geometry_move | add | delete | metadata (enum change_kind).'}
+      - {name: reason,               type: text,         nullable: false, description: Free-text rationale for the change (required — supports RQM-16).}
+      - {name: diff,                 type: jsonb,        nullable: true,  description: 'Structured diff payload (recommended shape: [{"path":[column],"before":v,"after":v}]).'}
+      - {name: created_at,           type: timestamptz,  nullable: false, description: Log insertion timestamp.}
+
+  # ---------------------------------------------------------------------------
+  # PROVENANCE PROFILE (ADR-provenance) — attribute-value and geometry grain,
+  # W3C PROV-O-inspired (entity / activity / agent), source-observation ↔
+  # adopted-value bridge. Rollup to dataset via source_observation.source_ref.
+  # ---------------------------------------------------------------------------
+  prov_agent:
+    domain: provenance
+    storage: postgres
+    grain: One row per person, organization, or software system responsible for observations or activities.
+    description: >
+      Provenance actor. A person (analyst, GIS reviewer), an organization
+      (USACE, FEMA, a contractor), or a software system (fit tool, ETL
+      pipeline). Referenced by source_observation and prov_activity so any
+      adopted value can be traced to responsible parties.
+    columns:
+      - {name: agent_id,   type: bigint,      pk: true, nullable: false, description: Surrogate primary key.}
+      - {name: agent_type, type: varchar(16), nullable: false, description: 'person | organization | software (enum agent_type).'}
+      - {name: agent_name, type: varchar(128),nullable: false, description: Human-readable agent name.}
+      - {name: agent_ref,  type: varchar(256),nullable: true,  description: Stable identifier (email, ORCID, org URI, software+version).}
+      - {name: created_at, type: timestamptz, nullable: false, description: Row insertion timestamp.}
+
+  prov_activity:
+    domain: provenance
+    storage: postgres
+    grain: One row per derivation activity that produced an adopted value.
+    description: >
+      A single activity that produced or modified an adopted value: import,
+      fit, impute, override, derive, calibrate. Captures the code/tool that
+      ran it and the agent responsible. Multi-step activity chains are not
+      modeled as separate entities at this maturity — only the terminal
+      adopted-value ↔ source-observation link is retained (see
+      docs/decisions/ADR-provenance.md).
+    columns:
+      - {name: activity_id,   type: bigint,      pk: true, nullable: false, description: Surrogate primary key.}
+      - {name: activity_type, type: varchar(16), nullable: false, description: 'import | fit | impute | override | derive | calibrate (enum activity_type).'}
+      - {name: method,        type: varchar(128),nullable: true,  description: 'Method name/reference (e.g., MLE, class-default, manual-edit).'}
+      - {name: description,   type: text,        nullable: true,  description: Free-text description of what the activity did.}
+      - {name: agent_id,      type: bigint,      fk: prov_agent.agent_id, nullable: false, description: Agent responsible for running the activity.}
+      - {name: code_ref,      type: varchar(128),nullable: true,  description: 'Tool + commit / package version (e.g., rqm-fit@a1b2c3).'}
+      - {name: started_at,    type: timestamptz, nullable: true,  description: Activity start time.}
+      - {name: ended_at,      type: timestamptz, nullable: true,  description: Activity end time.}
+
+  source_registry:
+    domain: provenance
+    storage: postgres
+    grain: One row per named source dataset referenced anywhere in the model.
+    description: >
+      Single policy surface for every source referenced by source_observation.
+      Classification is MANDATORY; stewardship (a real prov_agent) is
+      MANDATORY. Restricted classification requires a restricted_reason and
+      forces all citing observations to be redacted (observed_value=null,
+      is_redacted=true). policy_uri points at external policy documents
+      (DUAs, agency memos) — never an in-repo path (Prompt 11 rule 7). No raw
+      restricted values live in this schema; only references, classifications,
+      and derivatives (see ADR-restricted-sources). Deliberate varchar PK
+      parallels distribution_registry.family_name (readability at reference
+      sites).
+    columns:
+      - {name: source_ref,             type: varchar(128), pk: true, nullable: false, description: 'Natural key. Matches source_observation.source_ref (e.g., NSI-2024.1, COMMERCIAL-PARCEL-VENDOR-2024Q2, HAZUS-TMv6).'}
+      - {name: source_name,            type: varchar(128), nullable: false, description: Human-readable dataset name.}
+      - {name: source_kind,            type: varchar(32),  nullable: false, description: 'national_inventory | class_default | field_survey | remote_sensing | commercial_parcel | tribal | proprietary | agency_restricted | other (enum source_kind).'}
+      - {name: access_classification,  type: varchar(16),  nullable: false, description: 'public | internal | restricted (enum access_classification). No default — every source must be classified.'}
+      - {name: steward_agent_id,       type: bigint,       fk: prov_agent.agent_id, nullable: false, description: Prov_agent that owns access decisions for this source (no ownerless sources; Prompt 11 rule 4).}
+      - {name: policy_uri,             type: varchar(256), nullable: true,  description: 'External pointer to the access/handling policy (DUA, agency memo). Must be an external scheme — in-repo paths are rejected at CI (Prompt 11 rule 7). Locked invariant: no policy content is embedded here.'}
+      - {name: restricted_reason,      type: text,         nullable: true,  description: 'Required when access_classification=restricted (Prompt 11 rule 3). Rationale (PII / proprietary / security-sensitive / tribal-owned / …). Contains rationale, not protected values.'}
+      - {name: description,            type: text,         nullable: true,  description: Free-text; may not include restricted content.}
+      - {name: version_id,             type: bigint,       fk: versioning.version_id, nullable: false, description: Versioning row. Re-classification bumps a new version rather than mutating in place, so historical exports remain reconstructable.}
+      - {name: created_at,             type: timestamptz,  nullable: false, description: Row insertion timestamp.}
+
+  source_observation:
+    domain: provenance
+    storage: postgres
+    grain: One row per atomic raw observation from an external source.
+    description: >
+      Atomic raw observation from a named source (NSI, HAZUS class default,
+      field survey, remote sensing, commercial parcel data). One adopted value
+      may cite many source_observations via adopted_value_link. Enables the
+      "observation ≠ adopted value" invariant. source_ref FKs into
+      source_registry — classification and steward live there. When the
+      referenced registry row is access_classification=restricted, the
+      observation is stored as a REDACTED STUB: observed_value=null,
+      is_redacted=true (Prompt 11 rules 3 and 8). Raw restricted values are
+      never stored in this schema.
+    columns:
+      - {name: observation_id, type: bigint,       pk: true, nullable: false, description: Surrogate primary key.}
+      - {name: source_ref,     type: varchar(128), fk: source_registry.source_ref, nullable: false, description: 'Source identifier. FK into source_registry (ADR-restricted-sources) — classification and steward resolve there.'}
+      - {name: attribute_name, type: varchar(48),  nullable: false, description: 'Attribute observed (matches uncertainty_spec.attribute_name where applicable).'}
+      - {name: observed_value, type: jsonb,        nullable: true,  description: 'Raw observed value (scalar, sample, geometry ref, etc.), JSON-encoded. MUST be null when the referenced source is restricted (Prompt 11 rule 8). Null with is_redacted=false means "no value observed"; null with is_redacted=true means "value withheld by policy."'}
+      - {name: is_redacted,    type: boolean,      nullable: false, description: 'True when the raw observed_value has been withheld per source policy. Required true for every observation citing a restricted source (Prompt 11 rule 3).'}
+      - {name: units,          type: varchar(16),  nullable: true,  description: Physical units of the observed quantity (ft, m, class).}
+      - {name: quality,        type: real,         nullable: true,  description: "Analyst/source quality score in [0,1] (optional)."}
+      - {name: effective_time, type: timestamptz,  nullable: false, description: Real-world time this observation is valid for (valid-time; see Prompt 3 for bitemporality).}
+      - {name: recorded_at,    type: timestamptz,  nullable: false, description: System time when the observation was recorded here (record-time).}
+      - {name: agent_id,       type: bigint,       fk: prov_agent.agent_id, nullable: false, description: Agent that recorded this observation.}
+      - {name: notes,          type: text,         nullable: true,  description: Free-text context.}
+
+  adopted_value_link:
+    domain: provenance
+    storage: postgres
+    grain: One row per (adopted value, source observation) support link.
+    description: >
+      Bridge from any adopted entity (attribute distribution, foundation PMF,
+      DDF uncertainty row, hazard link, or geometry after Prompt 4) to the
+      source observations that support it plus the prov_activity that produced
+      it. Polymorphic parent uses the discriminator-on-relationship pattern:
+      (adopted_entity_type, adopted_entity_id) points at exactly one row in
+      the table named by adopted_entity_type. If no observation supports the
+      value (class default, engineering assumption), a single row with
+      is_default_or_assumed=true and a non-null assumption_rationale is required.
+    columns:
+      - {name: link_id,               type: bigint,      pk: true, nullable: false, description: Surrogate primary key.}
+      - {name: adopted_entity_type,   type: varchar(32), nullable: false, description: 'Parent entity kind (enum adopted_entity_type). Discriminator for the polymorphic parent.'}
+      - {name: adopted_entity_id,     type: bigint,      nullable: false, description: 'Id in the parent table named by adopted_entity_type. Not declared as a FK because the target table varies; validated in application/CI.'}
+      - {name: observation_id,        type: bigint,      fk: source_observation.observation_id, nullable: true, description: Supporting observation. Null only when is_default_or_assumed=true.}
+      - {name: activity_id,           type: bigint,      fk: prov_activity.activity_id, nullable: false, description: Activity that produced the adopted value.}
+      - {name: role,                  type: varchar(16), nullable: true,  description: 'primary | supporting | contradictory (enum observation_role); null when is_default_or_assumed=true.'}
+      - {name: is_default_or_assumed, type: boolean,     nullable: false, description: 'True when the adopted value has no supporting observation (class default, engineering assumption). Requires non-null assumption_rationale.'}
+      - {name: assumption_rationale,  type: text,        nullable: true,  description: 'Required when is_default_or_assumed=true. Free-text rationale (e.g., "RES1 default from HAZUS TM v6 §4.3; no site observation.").'}
+      - {name: created_at,            type: timestamptz, nullable: false, description: Link insertion timestamp.}
+
+# -----------------------------------------------------------------------------
+# DOMAIN G — EXPORTS & CONTRACTS  (ADR-exports)
+# Versioned export contract + emitted product + machine-readable lossiness
+# report. Draws the imputation boundary: cross-source selection, defaulting,
+# and imputation happen ONCE, in the governed export compiler; loss engines
+# consume products as-is. The reproducibility five-tuple is pinned per product:
+# (inventory_snapshot_id, contract version_id, compiler_version,
+#  source_checksum, seed_root).
+# -----------------------------------------------------------------------------
+  export_contract:
+    domain: exports
+    storage: postgres
+    grain: One row per versioned export-contract definition.
+    description: >
+      Versioned contract describing what a compiled export must contain, how
+      alternates are resolved, how missing values are imputed, and (for sampled
+      products) how draws are generated. Keyed to a target engine. Access level
+      gates emission of restricted-derived fields (ties into ADR-restricted-
+      sources, Prompt 6). A contract may back many export_product rows; each
+      product cites exactly one active contract version at bind time.
+    columns:
+      - {name: export_contract_id, type: bigint,       pk: true, nullable: false, description: Surrogate primary key.}
+      - {name: name,               type: varchar(96),  nullable: false, description: 'Human-readable contract name (e.g., inland_consequences_flat_v1).'}
+      - {name: target_engine,      type: varchar(64),  nullable: false, description: 'Engine this contract feeds (e.g., inland_consequences).'}
+      - {name: product_kind,       type: varchar(32),  nullable: false, description: 'deterministic | distribution_parameters | pre_sampled_realizations (enum export_product_kind). Sets row grain and required-field shape.'}
+      - {name: required_fields,    type: jsonb,        nullable: false, description: 'Array of {name, type, units, code_enum_ref, description, source_selector, imputation_policy, transform_ref?}. source_selector names the canonical value; imputation_policy names the fill rule.'}
+      - {name: selection_rules,    type: jsonb,        nullable: false, description: 'How alternates resolve (geometry purpose+is_selected_for_export; single uncertainty_ref per consumer; DDF version+peril+occupancy match).'}
+      - {name: sampling_policy,    type: jsonb,        nullable: true,  description: 'Required iff product_kind=pre_sampled_realizations: {n_realizations, seed_strategy, shuffle_scope}. Null otherwise (Prompt 11 rule 3).'}
+      - {name: access_level,       type: varchar(16),  nullable: false, description: 'public | internal | restricted (enum export_access_level). Restricted-derived fields are only emitted when access_level permits (Prompt 6 tie-in).'}
+      - {name: version_id,         type: bigint,       fk: versioning.version_id, nullable: false, description: Versioning row (bitemporal registry) for this contract revision.}
+      - {name: status,             type: varchar(16),  nullable: false, description: 'active | deprecated (enum export_contract_status). Products may only bind to active contracts at started_at.'}
+      - {name: description,        type: text,         nullable: true,  description: Free-text description.}
+      - {name: created_at,         type: timestamptz,  nullable: false, description: Row insertion timestamp.}
+
+  export_product:
+    domain: exports
+    storage: postgres
+    grain: One row per emitted export artifact.
+    description: >
+      Manifest + reproducibility record for one artifact produced by the export
+      compiler. Pins the canonical inventory snapshot, the bound contract
+      version, the compiler code version, the source checksum, and (for sampled
+      products) the root RNG seed. A single run may emit multiple products
+      (e.g., deterministic + distribution_parameters) — each is its own row.
+      The output_uri points at the object-store or Iceberg landing location.
+    columns:
+      - {name: export_product_id,      type: bigint,       pk: true, nullable: false, description: Surrogate primary key.}
+      - {name: run_id,                 type: bigint,       fk: run_catalog.run_id, nullable: false, description: Producing run.}
+      - {name: export_contract_id,     type: bigint,       fk: export_contract.export_contract_id, nullable: false, description: 'Bound contract. Exactly one per product; must be status=active at started_at (Prompt 11 rule 1).'}
+      - {name: inventory_snapshot_id,  type: bigint,       fk: versioning.version_id, nullable: false, description: Canonical inventory snapshot compiled from.}
+      - {name: product_kind,           type: varchar(32),  nullable: false, description: 'Must equal the bound contract''s product_kind at bind time (Prompt 11 rule 2).'}
+      - {name: output_uri,             type: varchar(256), nullable: false, description: Object-store URI (S3/GCS/Iceberg) of the emitted artifact.}
+      - {name: source_checksum,        type: varchar(96),  nullable: false, description: 'SHA-256 of concatenated source inputs at compile time; supports the immutable-run-snapshot invariant (Prompt 11 rule 9).'}
+      - {name: compiler_version,       type: varchar(32),  nullable: false, description: Semver of the export compiler that produced this artifact.}
+      - {name: seed_root,              type: bigint,       nullable: true,  description: 'Root RNG seed. Required iff product_kind=pre_sampled_realizations (Prompt 11 rule 3). Draw seeds derived as seed_root + realization_id per sampling_policy.'}
+      - {name: n_realizations,         type: integer,      nullable: true,  description: 'Draw count. Required iff product_kind=pre_sampled_realizations.'}
+      - {name: row_count,              type: bigint,       nullable: false, description: Rows in the emitted artifact.}
+      - {name: status,                 type: varchar(16),  nullable: false, description: 'queued | running | success | failed (enum export_status).'}
+      - {name: started_at,             type: timestamptz,  nullable: true,  description: Compilation start time.}
+      - {name: finished_at,            type: timestamptz,  nullable: true,  description: Compilation completion time.}
+      - {name: created_at,             type: timestamptz,  nullable: false, description: Row insertion timestamp.}
+
+  export_lossiness_report:
+    domain: exports
+    storage: postgres
+    grain: One row per canonical entity dropped or collapsed by an export.
+    description: >
+      Machine-readable record of what the contract chose to leave out. Every
+      alternate geometry not selected, every uncertainty collapsed to a central
+      estimate in a deterministic product, every component below the contract's
+      coverage floor, every value imputed rather than observed, and every
+      redaction of a restricted-derived field lands here. Polymorphic parent:
+      (discarded_entity_type, discarded_entity_id) resolves in the table named
+      by discarded_entity_type; no hard FK because the target varies
+      (validated in application/CI, same pattern as adopted_value_link).
+    columns:
+      - {name: lossiness_id,           type: bigint,       pk: true, nullable: false, description: Surrogate primary key.}
+      - {name: export_product_id,      type: bigint,       fk: export_product.export_product_id, nullable: false, description: Parent export product.}
+      - {name: discarded_entity_type,  type: varchar(32),  nullable: false, description: 'geometries | uncertainty_spec | building_components | ddf_uncertainty | hazard_links | uncertainty_ref (enum lossiness_entity_type). Discriminator for the polymorphic reference.'}
+      - {name: discarded_entity_id,    type: bigint,       nullable: false, description: 'Id in the table named by discarded_entity_type. Not declared as an FK; validated in application/CI.'}
+      - {name: reason,                 type: varchar(48),  nullable: false, description: 'not_selected_for_export | alternative_representation | superseded_by_default | redacted_restricted | out_of_scope_for_contract | collapsed_to_central_estimate (enum lossiness_reason).'}
+      - {name: description,            type: text,         nullable: true,  description: 'Free-text elaboration (e.g., "Allegheny cadastre footprint not selected; NSI footprint chosen per contract §3.2").'}
+      - {name: created_at,             type: timestamptz,  nullable: false, description: Row insertion timestamp.}

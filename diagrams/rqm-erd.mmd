@@ -10,8 +10,8 @@ erDiagram
   %% ---------- DOMAIN A: INVENTORY (PostgreSQL) ----------
   buildings {
     bigint building_id PK
+    bigint asset_id FK
     bigint fd_id
-    geometry geom
     varchar occupancy_type
     smallint number_stories
     double building_cost
@@ -27,30 +27,98 @@ erDiagram
     bigint generic_id FK
     double replacement_cost
   }
+  component_connection {
+    bigint connection_id PK
+    bigint from_component_id FK
+    bigint to_component_id FK
+    varchar connection_kind
+    text description
+    bigint version_id FK
+  }
   generics {
     bigint generic_id PK
+    varchar kind
     varchar category
     varchar subtype
     varchar schema_ref
+    text description
+    bigint version_id FK
+  }
+  generic_building_component {
+    bigint generic_id PK
+    varchar damage_relevance
+    real typical_replacement_cost_fraction
+  }
+  geometries {
+    bigint geometry_id PK
+    bigint asset_id FK
+    bigint component_id FK
+    varchar role
+    varchar crs
+    geometry geom
+    varchar purpose
+    boolean is_selected_for_export
+    varchar alt_group_key
+    varchar source_ref
+    bigint validity_version_id FK
   }
 
   %% ---------- DOMAIN B: ATTRIBUTE UNCERTAINTY (PostgreSQL) ----------
-  attribute_distributions {
-    bigint dist_id PK
-    bigint building_id FK
-    bigint component_id FK
+  %% Generalized uncertainty class: superclass + typed children + shareable ref
+  %% + first-class correlations. Replaces attribute_distributions & foundation_pmf.
+  uncertainty_spec {
+    bigint uncertainty_spec_id PK
+    varchar kind
     varchar attribute_name
-    varchar dist_family
-    jsonb parameters
-    jsonb conditioning
+    varchar units
+    varchar scope
+    varchar scope_ref
     bigint version_id FK
   }
-  foundation_pmf {
-    bigint pmf_id PK
-    bigint building_id FK
-    varchar foundation_class
-    real probability
+  uncertainty_spec_continuous {
+    bigint uncertainty_spec_id PK
+    varchar dist_family FK
+    jsonb parameters
+    varchar support_type
+    real lower_bound
+    real upper_bound
+  }
+  uncertainty_spec_categorical {
+    bigint uncertainty_spec_id PK
+    jsonb categories_pmf
     varchar shuffle_policy
+  }
+  uncertainty_spec_deterministic {
+    bigint uncertainty_spec_id PK
+    jsonb value
+    varchar value_type
+  }
+  uncertainty_ref {
+    bigint ref_id PK
+    varchar consumer_type
+    bigint consumer_id
+    varchar attribute_name
+    bigint uncertainty_spec_id FK
+  }
+  uncertainty_correlation {
+    bigint correlation_id PK
+    bigint spec_a_id FK
+    bigint spec_b_id FK
+    varchar kind
+    jsonb specification
+    bigint version_id FK
+  }
+  distribution_registry {
+    varchar family_name PK
+    varchar family_kind
+    jsonb parameter_contract
+    varchar support_type
+    varchar sampler_backend
+    varchar sampler_ref
+    varchar pdf_ref
+    varchar cdf_ref
+    varchar ppf_ref
+    varchar status
     bigint version_id FK
   }
 
@@ -71,7 +139,7 @@ erDiagram
     real aep
     varchar peril_type
     varchar depth_grid_uri
-    varchar depth_dist_family
+    varchar depth_dist_family FK
     jsonb depth_parameters
     varchar grid_version
   }
@@ -91,6 +159,7 @@ erDiagram
     bigint ddf_id FK
     real depth_ft
     real damage_mean
+    bigint spread_spec_id FK
     real damage_p10
     real damage_p50
     real damage_p90
@@ -151,6 +220,126 @@ erDiagram
     varchar entity_ref
     varchar semver
     bigint parent_version_id FK
+    timestamptz valid_from
+    timestamptz valid_to
+    timestamptz record_from
+    timestamptz record_to
+  }
+
+  %% ---------- IDENTITY / BRANCH / REVISION (ADR-versioning) ----------
+  asset {
+    bigint asset_id PK
+    varchar asset_type
+    varchar canonical_external_ref
+  }
+  inventory_branch {
+    bigint branch_id PK
+    varchar name
+    bigint parent_branch_id FK
+    varchar purpose
+    bigint created_by_agent_id FK
+    varchar status
+    bigint merged_into_branch_id FK
+  }
+  asset_revision {
+    bigint revision_id PK
+    bigint asset_id FK
+    bigint branch_id FK
+    bigint version_id FK
+    timestamptz valid_from
+    timestamptz valid_to
+    boolean is_current
+  }
+  revision_log {
+    bigint log_id PK
+    bigint version_id FK
+    bigint editor_agent_id FK
+    varchar change_kind
+    text reason
+    jsonb diff
+  }
+
+  %% ---------- PROVENANCE PROFILE (ADR-provenance) ----------
+  prov_agent {
+    bigint agent_id PK
+    varchar agent_type
+    varchar agent_name
+    varchar agent_ref
+  }
+  prov_activity {
+    bigint activity_id PK
+    varchar activity_type
+    varchar method
+    bigint agent_id FK
+    varchar code_ref
+  }
+  source_registry {
+    varchar source_ref PK
+    varchar source_name
+    varchar source_kind
+    varchar access_classification
+    bigint steward_agent_id FK
+    varchar policy_uri
+    text restricted_reason
+    bigint version_id FK
+  }
+  source_observation {
+    bigint observation_id PK
+    varchar source_ref FK
+    varchar attribute_name
+    jsonb observed_value
+    boolean is_redacted
+    varchar units
+    real quality
+    timestamptz effective_time
+    timestamptz recorded_at
+    bigint agent_id FK
+  }
+  adopted_value_link {
+    bigint link_id PK
+    varchar adopted_entity_type
+    bigint adopted_entity_id
+    bigint observation_id FK
+    bigint activity_id FK
+    varchar role
+    boolean is_default_or_assumed
+    text assumption_rationale
+  }
+
+  %% ---------- DOMAIN G: EXPORTS & CONTRACTS (ADR-exports) ----------
+  export_contract {
+    bigint export_contract_id PK
+    varchar name
+    varchar target_engine
+    varchar product_kind
+    jsonb required_fields
+    jsonb selection_rules
+    jsonb sampling_policy
+    varchar access_level
+    bigint version_id FK
+    varchar status
+  }
+  export_product {
+    bigint export_product_id PK
+    bigint run_id FK
+    bigint export_contract_id FK
+    bigint inventory_snapshot_id FK
+    varchar product_kind
+    varchar output_uri
+    varchar source_checksum
+    varchar compiler_version
+    bigint seed_root
+    integer n_realizations
+    bigint row_count
+    varchar status
+  }
+  export_lossiness_report {
+    bigint lossiness_id PK
+    bigint export_product_id FK
+    varchar discarded_entity_type
+    bigint discarded_entity_id
+    varchar reason
+    text description
   }
 
   %% ---------------- RELATIONSHIPS ----------------
@@ -158,13 +347,49 @@ erDiagram
   buildings              ||--o{ building_components     : "decomposes into"
   generics               ||--o{ building_components     : "typed by"
   versioning             ||--o{ buildings               : "versions"
+  asset                  ||--o{ buildings               : "current-head projection of"
 
-  %% Attribute uncertainty
-  buildings              ||--o{ attribute_distributions : "has uncertain attrs"
-  building_components     ||--o{ attribute_distributions : "scoped to"
-  buildings              ||--o{ foundation_pmf          : "shuffled foundation"
-  versioning             ||--o{ attribute_distributions : "versions"
-  versioning             ||--o{ foundation_pmf          : "versions"
+  %% Geometry as its own class (ADR-geometry)
+  asset                  ||--o{ geometries              : "represented by"
+  building_components    ||--o{ geometries              : "component geometry"
+  versioning             ||--o{ geometries              : "versions"
+
+  %% Component connections (ADR-citygml-profile)
+  building_components    ||--o{ component_connection    : "edge endpoint"
+  versioning             ||--o{ component_connection    : "versions"
+
+  %% Generics generalization (ADR-generics) — SQL supertype/subtable, kind discriminator
+  generics               ||--|| generic_building_component : "kind=building_component"
+  versioning             ||--o{ generics                 : "versions"
+
+  %% Identity / branch / revision (ADR-versioning)
+  asset                  ||--o{ asset_revision          : "revised as"
+  inventory_branch       ||--o{ asset_revision          : "on branch"
+  versioning             ||--o{ asset_revision          : "bitemporal registry for"
+  inventory_branch       |o--o{ inventory_branch        : "parent / merged-into"
+  prov_agent             ||--o{ inventory_branch        : "created by"
+  versioning             ||--o{ revision_log            : "changed by"
+  prov_agent             ||--o{ revision_log            : "edited by"
+
+  %% Attribute uncertainty (ADR-uncertainty)
+  uncertainty_spec       ||--|| uncertainty_spec_continuous     : "kind=continuous"
+  uncertainty_spec       ||--|| uncertainty_spec_categorical    : "kind=categorical"
+  uncertainty_spec       ||--|| uncertainty_spec_deterministic  : "kind=deterministic"
+  uncertainty_spec       ||--o{ uncertainty_ref         : "referenced by"
+  uncertainty_spec       ||--o{ uncertainty_correlation : "spec_a / spec_b"
+  versioning             ||--o{ uncertainty_spec        : "versions"
+  versioning             ||--o{ uncertainty_correlation : "versions"
+  %% Polymorphic consumer: uncertainty_ref.(consumer_type, consumer_id) points at
+  %% one of buildings | building_components | ddf_uncertainty | hazard_links |
+  %% virtual. No hard FK — see ADR-uncertainty §Validation rules.
+
+  %% Distribution registry (ADR-distribution-registry)
+  distribution_registry  ||--o{ uncertainty_spec_continuous : "family contract"
+  distribution_registry  ||--o{ hazard_links                : "depth-family contract"
+  versioning             ||--o{ distribution_registry       : "versions"
+
+  %% DDF-as-distribution (ADR-ddf-uncertainty) — spread reached via uncertainty_spec
+  uncertainty_spec       ||--o{ ddf_uncertainty             : "damage-ratio spread spec"
 
   %% Hazard linkage
   buildings              ||--o{ hazard_links            : "exposed to depth"
@@ -187,3 +412,28 @@ erDiagram
   run_catalog            ||--o{ run_logs                : "logs"
   run_catalog            ||--o{ mv_loss_summary         : "summarized by"
   versioning             |o--o{ versioning              : "lineage parent"
+
+  %% Provenance profile (ADR-provenance)
+  prov_agent             ||--o{ prov_activity           : "runs"
+  prov_agent             ||--o{ source_observation      : "records"
+  %% Restricted-source handling (ADR-restricted-sources)
+  source_registry        ||--o{ source_observation      : "classifies"
+  prov_agent             ||--o{ source_registry         : "stewarded by"
+  versioning             ||--o{ source_registry         : "versions"
+  prov_activity          ||--o{ adopted_value_link      : "produced by"
+  source_observation     ||--o{ adopted_value_link      : "supports"
+  %% Polymorphic parent: adopted_value_link.(adopted_entity_type, adopted_entity_id)
+  %% points at exactly one of uncertainty_spec | ddf_uncertainty | hazard_links |
+  %% geometries (ADR-geometry replaces the earlier buildings placeholder).
+  %% No hard FK declared — see ADR-provenance §Validation extension.
+
+  %% Exports & contracts (ADR-exports)
+  versioning             ||--o{ export_contract          : "versions"
+  export_contract        ||--o{ export_product           : "governs"
+  run_catalog            ||--o{ export_product           : "produces"
+  versioning             ||--o{ export_product           : "inventory snapshot"
+  export_product         ||--o{ export_lossiness_report  : "lossiness"
+  %% Polymorphic parent: export_lossiness_report.(discarded_entity_type,
+  %% discarded_entity_id) points at one of geometries | uncertainty_spec |
+  %% building_components | ddf_uncertainty | hazard_links | uncertainty_ref.
+  %% No hard FK — validated in app/CI (same pattern as adopted_value_link).
