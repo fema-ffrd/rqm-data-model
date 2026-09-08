@@ -74,9 +74,9 @@ flowchart LR
 
 A flat dataset contains one row per building and columns for the selected geometry and attributes needed for analysis. The geometry may be a point, 2D footprint, or another supported form.
 
-**Main benefit:** Simple and similar to the current point-based workflow.
+**Benefit:** Simple and similar to the current point-based workflow.
 
-**Main limitation:** Difficult to retain multiple geometry representations, components, and revisions for the same building.
+**Limitation:** Difficult to retain multiple geometry representations, components, and revisions for the same building.
 
 ### Option 2: Linked Data Tables
 
@@ -97,9 +97,9 @@ flowchart LR
 
 Linked tables use identifiers to connect related information. i.e, one building record can connect to multiple geometry, component, or version records.
 
-**Main benefit:** Supports multiple geometries, levels of detail, components, inventory versions, and revisions.
+**Benefit:** Supports multiple geometries, levels of detail, components, inventory versions, and revisions.
 
-**Main limitation:** Analysis processes must be able to use the connected tables.
+**Limitation:** Analysis processes must be able to use the connected tables.
 
 ### Option 3: Detailed Linked Data with Calculation-Ready Exports
 
@@ -122,9 +122,9 @@ flowchart LR
 
 The analysis export is a separate flat dataset containing the information required for a specific analysis. The export may be created through ETL.
 
-**Main benefit:** Retains detailed building information while giving each analysis only the data it requires.
+**Benefit:** Retains detailed building information while giving each analysis only the data it requires.
 
-**Main limitation:** Each export requires documented transformation, validation, and traceability rules.
+**Limitation:** Each export requires documented transformation, validation, and traceability rules.
 
 Detailed linked data does not require every building to have detailed 3D geometry. It allows progressively richer information to be retained when available.
 
