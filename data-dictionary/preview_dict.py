@@ -19,20 +19,48 @@ DOMAIN_TITLES = {
     "ddf": "D — Depth-Damage Functions (probabilistic DDFs)",
     "realization_results": "E — Realization & Loss Results (ensemble scale)",
     "provenance": "F — Provenance & Versioning",
+    "exports": "G — Exports & Contracts",
 }
 
 TIER_BADGE = {"postgres": "PostgreSQL", "iceberg": "Iceberg", "icechunk": "Icechunk"}
 
 
 def validate(model):
+    """Static schema-level checks. Runtime data-content checks live in the ADRs
+    (numbered rules per ADR) and are enforced at ingest/compile time — this
+    validator only sees the YAML.
+    """
     tables = model["tables"]
+    declared_domains = set(model["metadata"].get("domains", []))
     colindex = {t: {c["name"] for c in tables[t]["columns"]} for t in tables}
     errors = []
     for tname, t in tables.items():
+        # Table-level checks
+        if not (t.get("description") or "").strip():
+            errors.append(f"[{tname}] table is missing a description")
+        if not (t.get("grain") or "").strip():
+            errors.append(f"[{tname}] table is missing a grain")
+        if declared_domains and t.get("domain") not in declared_domains:
+            errors.append(
+                f"[{tname}] domain '{t.get('domain')}' not declared in metadata.domains"
+            )
+        if t.get("domain") not in DOMAIN_TITLES:
+            errors.append(
+                f"[{tname}] domain '{t.get('domain')}' has no DOMAIN_TITLES entry — "
+                "table would not render in the generated Markdown"
+            )
         pks = [c["name"] for c in t["columns"] if c.get("pk")]
         if t["storage"] == "postgres" and not pks:
             errors.append(f"[{tname}] postgres table has no primary key")
+        # Column-level checks
         for c in t["columns"]:
+            if not c.get("name"):
+                errors.append(f"[{tname}] column missing 'name'")
+                continue
+            if not (c.get("type") or "").strip():
+                errors.append(f"[{tname}.{c['name']}] missing type")
+            if not (c.get("description") or "").strip():
+                errors.append(f"[{tname}.{c['name']}] missing description")
             fk = c.get("fk")
             if fk:
                 if "." not in fk:
@@ -42,7 +70,24 @@ def validate(model):
                 if ft not in tables:
                     errors.append(f"[{tname}.{c['name']}] fk -> unknown table '{ft}'")
                 elif fc not in colindex[ft]:
-                    errors.append(f"[{tname}.{c['name']}] fk -> unknown column '{ft}.{fc}'")
+                    errors.append(
+                        f"[{tname}.{c['name']}] fk -> unknown column '{ft}.{fc}'"
+                    )
+        # SQL supertype/subtable integrity: any column that is BOTH pk and fk
+        # must FK a superclass whose own PK column has the same name (identity
+        # inheritance). This is the pattern shared by uncertainty_spec_* and
+        # generic_building_component (see ADR-uncertainty, ADR-generics).
+        for c in t["columns"]:
+            if c.get("pk") and c.get("fk"):
+                fk = c["fk"]
+                if "." in fk:
+                    ft, fc = fk.split(".", 1)
+                    if ft in tables and fc != c["name"]:
+                        errors.append(
+                            f"[{tname}.{c['name']}] supertype/subtable pattern "
+                            f"expects the FK column to share its parent's PK name "
+                            f"('{fc}' != '{c['name']}')"
+                        )
     return errors
 
 

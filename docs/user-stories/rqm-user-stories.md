@@ -7,7 +7,7 @@
 
 These stories add building-data needs not fully covered by the existing FFRD user stories. In this document, **asset** refers to a building or other infrastructure represented in the data model.
 
-A later validated version will show how the proposed architecture, tables, fields, and relationships support each story.
+The per-story architecture mapping — which ADR, entity/field, and validation rule serves each RQM-01…RQM-18 — is maintained in [../review/issue-1-traceability.md](../review/issue-1-traceability.md).
 
 ## User Stories
 
