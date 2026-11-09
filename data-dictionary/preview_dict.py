@@ -2,7 +2,8 @@
 """Render data-dictionary.md from data-dictionary.yaml and validate integrity.
 
 The YAML is the single source of truth; the Markdown is generated. Also validates that every
-foreign key points to an existing table.column.
+foreign key points to an existing table.column and that every table of a tier that requires
+a primary key has one.
 """
 import sys
 import yaml
@@ -13,15 +14,16 @@ SRC = HERE / "data-dictionary.yaml"
 OUT = HERE / "data-dictionary.md"
 
 DOMAIN_TITLES = {
-    "inventory": "A — Inventory (coverage of building inventory / components)",
-    "attribute_uncertainty": "B — Attribute Uncertainty (uncertainty quantification)",
-    "hazard_linkage": "C — Hazard Linkage (probabilistic flood depth)",
-    "ddf": "D — Depth-Damage Functions (probabilistic DDFs)",
-    "realization_results": "E — Realization & Loss Results (ensemble scale)",
-    "provenance": "F — Provenance & Versioning",
+    "inventory": "A — Inventory (NSI structures + first-class geometry)",
 }
 
-TIER_BADGE = {"postgres": "PostgreSQL", "iceberg": "Iceberg", "icechunk": "Icechunk"}
+TIER_BADGE = {
+    "postgres": "PostgreSQL",
+    "iceberg": "Iceberg (via Apache Sedona)",
+    "icechunk": "Icechunk",
+}
+
+PK_REQUIRED_TIERS = {"postgres", "iceberg"}
 
 
 def validate(model):
@@ -29,9 +31,14 @@ def validate(model):
     colindex = {t: {c["name"] for c in tables[t]["columns"]} for t in tables}
     errors = []
     for tname, t in tables.items():
+        if t["domain"] not in DOMAIN_TITLES:
+            errors.append(
+                f"[{tname}] domain '{t['domain']}' has no DOMAIN_TITLES entry — "
+                "table would not render in the generated Markdown"
+            )
         pks = [c["name"] for c in t["columns"] if c.get("pk")]
-        if t["storage"] == "postgres" and not pks:
-            errors.append(f"[{tname}] postgres table has no primary key")
+        if t["storage"] in PK_REQUIRED_TIERS and not pks:
+            errors.append(f"[{tname}] {t['storage']} table has no primary key")
         for c in t["columns"]:
             fk = c.get("fk")
             if fk:
@@ -52,15 +59,19 @@ def render(model):
     lines.append(f"# {m['model_name']} — Data Dictionary\n")
     lines.append(
         f"**Version:** {m['version']} &nbsp;|&nbsp; "
-        f"**Companion:** `{m['companion_repo']}`\n"
+        f"**Companion:** `{m['companion_repo']}` &nbsp;|&nbsp; "
+        f"**Query engine:** {m.get('query_engine', '')}\n"
     )
     lines.append(
-        "Deterministic building-loss inputs (flood depth, foundation type, "
-        "first-floor height, depth-damage function) are re-architected as "
-        "first-class, versioned **distribution** objects for probabilistic risk "
-        "assessment. Storage tiers are inherited from the FFRD data model: "
-        "**PostgreSQL** (relational integrity), **Iceberg** (ensemble-scale "
-        "results), **Icechunk/Zarr** (gridded hazard fields).\n"
+        "NSI-minimal edition: a focused, loadable schema for a single National "
+        "Structure Inventory parquet ingest, with first-class multiple-geometry "
+        "support (ADR-geometry) preserved so additional footprint sources can be "
+        "attached beside each NSI point without a schema break. Component "
+        "decomposition, attribute uncertainty, hazard links, DDFs, loss "
+        "realizations, export contracts, provenance registry, and bitemporal "
+        "versioning are deferred; re-entry points are documented in "
+        "ADR-nsi-minimal. The previous full-coverage dictionary is preserved at "
+        "`data-dictionary-full.yaml`.\n"
     )
 
     # Table of contents

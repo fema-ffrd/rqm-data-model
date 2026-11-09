@@ -1,0 +1,187 @@
+# =============================================================================
+# Risk Quantification Methodology (RQM) Data Model — NSI-Minimal Edition
+# -----------------------------------------------------------------------------
+# A focused, loadable schema for a single National Structure Inventory (NSI)
+# parquet ingest, with first-class multiple-geometry support (ADR-geometry)
+# preserved so that additional footprint sources (Microsoft Building
+# Footprints, FEMA USA Structures) can be attached beside each NSI point
+# without a schema break.
+#
+# Supersedes the hybrid data model's inventory / uncertainty / hazard / DDF /
+# realization / exports / provenance / versioning surface for v0.1. Re-entry
+# points for the deferred domains are documented in ADR-nsi-minimal.
+#
+# The previous full-coverage dictionary is preserved at data-dictionary-full.yaml
+# for reference; diff against that file to see exactly what was deferred.
+#
+# Storage tier:
+#   iceberg -> relational, versioned Iceberg tables accessed via Apache Sedona
+#              (Spark 3.x) for SQL, geometry (ST_*), and batch ingest.
+# =============================================================================
+
+metadata:
+  model_name: Risk Quantification Methodology (RQM) Data Model — NSI Minimal
+  version: 0.2.0
+  companion_repo: fema-ffrd/inland-consequences
+  storage_tiers: [iceberg]
+  query_engine: Apache Sedona (Spark 3.x)
+  domains: [inventory]
+
+# -----------------------------------------------------------------------------
+# ENUMERATIONS
+# Inlined as varchar + CHECK/enum declaration. NSI already publishes stable
+# short codes; no lookup table buys anything until per-code metadata (RSMeans
+# rates, fragility curves) is needed — and adding a lookup is additive, not a
+# schema break.
+# -----------------------------------------------------------------------------
+enums:
+  occtype:
+    # HAZUS occupancy classes used by NSI; not exhaustive but covers v0.1.
+    - RES1          # Single-family
+    - RES2          # Mobile home
+    - RES3A         # Multi-family 2 units
+    - RES3B         # Multi-family 3-4 units
+    - RES3C         # Multi-family 5-9 units
+    - RES3D         # Multi-family 10-19 units
+    - RES3E         # Multi-family 20-49 units
+    - RES3F         # Multi-family 50+ units
+    - RES4          # Hotel / motel
+    - RES5          # Institutional dorm
+    - RES6          # Nursing home
+    - COM1          # Retail trade
+    - COM2          # Wholesale trade
+    - COM3          # Personal / repair services
+    - COM4          # Professional offices
+    - COM5          # Bank
+    - COM6          # Hospital
+    - COM7          # Medical office / clinic
+    - COM8          # Entertainment / recreation
+    - COM9          # Theater
+    - COM10         # Parking garage
+    - IND1          # Heavy industrial
+    - IND2          # Light industrial
+    - IND3          # Food / drugs / chemicals
+    - IND4          # Metals / mineral processing
+    - IND5          # High technology
+    - IND6          # Construction
+    - AGR1          # Agriculture
+    - GOV1          # General services
+    - GOV2          # Emergency response
+    - EDU1          # Schools
+    - EDU2          # Colleges / universities
+    - REL1          # Churches / non-profit
+  st_damcat:
+    - RES           # Residential
+    - COM           # Commercial
+    - IND           # Industrial
+    - PUB           # Public
+    - AGR           # Agricultural
+  found_type:
+    - S             # Slab on grade
+    - C             # Crawlspace
+    - B             # Basement
+    - P             # Pier / post
+    - F             # Fill / elevated
+  geometry_role:
+    - point
+    - footprint
+  geometry_purpose:
+    - computation
+    - hazard_sampling
+    - display
+    - qc
+
+# -----------------------------------------------------------------------------
+# DOMAIN A — INVENTORY  (NSI structures + first-class geometry)
+# -----------------------------------------------------------------------------
+tables:
+
+  buildings:
+    domain: inventory
+    storage: iceberg
+    grain: One row per NSI structure.
+    description: >
+      Flat NSI inventory projection. Every NSI parquet column maps 1:1 to a
+      column on this table, using NSI's native field names (occtype,
+      num_story, val_struct, pop2amu65, …) so queries line up with the raw
+      source. Geometry lives in the `geometries` table (ADR-geometry
+      preserved). Component decomposition, attribute uncertainty specs,
+      hazard links, DDFs, loss realizations, export contracts, provenance
+      registry, and bitemporal versioning are all deferred; re-entry points
+      are documented in ADR-nsi-minimal. The primary key `building_id` is a
+      surrogate generated at ingest; `fd_id` is the external natural key.
+    columns:
+      - {name: building_id,  type: bigint,       pk: true, nullable: false, description: Surrogate primary key (generated at ingest; logical identity).}
+      - {name: fd_id,        type: bigint,       nullable: true,  description: NSI structure id (external natural key; logically UNIQUE where not null).}
+      - {name: bid,          type: bigint,       nullable: true,  description: NSI block id.}
+      - {name: usastrucid,   type: varchar(32),  nullable: true,  description: FEMA USA Structures id (joins to USAS footprint source).}
+      - {name: ftprntid,     type: varchar(64),  nullable: true,  description: Footprint id as reported by NSI (joins to geometries.source_ref when the footprint source is attached).}
+      - {name: ftprntsrc,    type: varchar(32),  nullable: true,  description: Footprint source tag (MSBF, USAS, ...).}
+      - {name: source,       type: varchar(32),  nullable: true,  description: NSI release tag (e.g., NSI-2024.1); becomes geometries.source_ref prefix.}
+      - {name: occtype,      type: varchar(16),  nullable: false, description: Occupancy classification code (enum occtype; e.g., RES1, COM1).}
+      - {name: st_damcat,    type: varchar(16),  nullable: true,  description: Structure damage category (enum st_damcat; RES, COM, IND, PUB, AGR).}
+      - {name: bldgtype,     type: varchar(16),  nullable: true,  description: Construction class code (e.g., W1 wood light-frame, M1 masonry).}
+      - {name: num_story,    type: smallint,     nullable: true,  description: Story count.}
+      - {name: sqft,         type: double,       nullable: true,  description: Reported structure area, square feet.}
+      - {name: ftprntsqft,   type: double,       nullable: true,  description: Footprint-derived area, square feet (may differ from sqft for multi-story structures).}
+      - {name: bldheight,    type: real,         nullable: true,  description: Building height, feet.}
+      - {name: med_yr_blt,   type: smallint,     nullable: true,  description: Median year built for the structure (or its block/cohort).}
+      - {name: found_type,   type: varchar(16),  nullable: true,  description: Foundation type code (enum found_type; S slab, C crawlspace, B basement, P pier, F fill/elevated).}
+      - {name: found_ht,     type: real,         nullable: true,  description: First-floor height above adjacent grade, feet.}
+      - {name: val_struct,   type: double,       nullable: true,  description: Structure replacement value, USD.}
+      - {name: val_cont,     type: double,       nullable: true,  description: Contents replacement value, USD.}
+      - {name: val_vehic,    type: double,       nullable: true,  description: Vehicle value attributed to structure, USD.}
+      - {name: ornl_low,     type: double,       nullable: true,  description: ORNL low-value estimate, USD (alternate value basis).}
+      - {name: ornl_med,     type: double,       nullable: true,  description: ORNL median-value estimate, USD.}
+      - {name: ornl_hgh,     type: double,       nullable: true,  description: ORNL high-value estimate, USD.}
+      - {name: resunits,     type: real,         nullable: true,  description: Residential units contained in structure.}
+      - {name: novehprob,    type: real,         nullable: true,  description: Probability that the household has no vehicle.}
+      - {name: vehperunit,   type: real,         nullable: true,  description: Vehicles per residential unit.}
+      - {name: pop2amu65,    type: real,         nullable: true,  description: 2 AM population, under 65 years old.}
+      - {name: pop2amo65,    type: real,         nullable: true,  description: 2 AM population, 65 years old and over.}
+      - {name: pop2pmu65,    type: real,         nullable: true,  description: 2 PM population, under 65 years old.}
+      - {name: pop2pmo65,    type: real,         nullable: true,  description: 2 PM population, 65 years old and over.}
+      - {name: u65disable,   type: real,         nullable: true,  description: Under-65 disabled population attributed to structure.}
+      - {name: o65disable,   type: real,         nullable: true,  description: 65-and-over disabled population attributed to structure.}
+      - {name: students,     type: real,         nullable: true,  description: Student population attributed to structure.}
+      - {name: firmzone,     type: varchar(16),  nullable: true,  description: FIRM (Flood Insurance Rate Map) flood zone code.}
+      - {name: zone_sub,     type: varchar(16),  nullable: true,  description: FIRM zone subtype / qualifier.}
+      - {name: static_bfe,   type: real,         nullable: true,  description: Static base flood elevation, feet.}
+      - {name: ground_elv,   type: real,         nullable: true,  description: Ground elevation at structure, feet.}
+      - {name: grnd_elv_m,   type: real,         nullable: true,  description: Ground elevation at structure, meters.}
+      - {name: pctlowclr,    type: real,         nullable: true,  description: NSI pctlowclr indicator (percent low-clearance).}
+      - {name: fullrep,      type: real,         nullable: true,  description: NSI fullrep indicator (full-replacement flag or share).}
+      - {name: depindex,     type: real,         nullable: true,  description: NSI dependency index.}
+      - {name: creprcnt,     type: real,         nullable: true,  description: NSI community-resilience percent indicator.}
+      - {name: crerank,      type: integer,      nullable: true,  description: NSI community-resilience rank.}
+      - {name: cbfips,       type: varchar(15),  nullable: true,  description: Census block GEOID (15-digit FIPS) for community-level aggregation.}
+      - {name: ingested_at,  type: timestamp,    nullable: false, description: Row insertion timestamp (serves as the v0.1 version history until bitemporal versioning returns).}
+
+  geometries:
+    domain: inventory
+    storage: iceberg
+    grain: One row per (building, representation, alternate) geometric record.
+    description: >
+      First-class geometry registry (ADR-geometry preserved). Each row holds
+      one geometric representation of a building. The NSI load produces
+      exactly one row per structure with role='point',
+      purpose='computation', is_selected_for_export=true, geom from the
+      parquet `shape` column (EPSG:3857). Alternate footprints (MSBF, USAS)
+      land as additional rows with role='footprint' and may flip the
+      selected flag via a separate selection migration. Logical invariant:
+      exactly one row per (building_id, purpose='computation') has
+      is_selected_for_export=true at any time — enforced by the ingest script
+      and smoke tests (Iceberg does not enforce UNIQUE). 3D roles,
+      component-level geometry, and bitemporal validity are deferred (see
+      ADR-nsi-minimal re-entry map).
+    columns:
+      - {name: geometry_id,            type: bigint,       pk: true, nullable: false, description: Surrogate primary key.}
+      - {name: building_id,            type: bigint,       fk: buildings.building_id, nullable: false, description: Parent structure (logical FK; cascade behavior enforced by the ingest contract).}
+      - {name: role,                   type: varchar(16),  nullable: false, description: 'Geometry role (enum geometry_role): point | footprint. 3D roles deferred.'}
+      - {name: purpose,                type: varchar(16),  nullable: false, description: 'Why this representation exists (enum geometry_purpose): computation | hazard_sampling | display | qc.'}
+      - {name: is_selected_for_export, type: boolean,      nullable: false, description: Exactly one TRUE per (building_id, purpose='computation') at any time (logical invariant; asserted in smoke tests).}
+      - {name: alt_group_key,          type: varchar(64),  nullable: true,  description: Groups competing alternates at the same (building_id, role) — e.g., two footprints from different sources share a key.}
+      - {name: source_ref,             type: varchar(64),  nullable: true,  description: 'Source dataset identifier (e.g., NSI-2024.1, MSBF-2022-10, USAS-2024).'}
+      - {name: crs,                    type: varchar(16),  nullable: false, description: EPSG string for this row's geometry (e.g., EPSG:3857 for NSI; alternates keep native CRS).}
+      - {name: geom,                   type: geometry,     nullable: false, description: Sedona geometry value; Point for role='point', Polygon/MultiPolygon for role='footprint'.}
+      - {name: ingested_at,            type: timestamp,    nullable: false, description: Row insertion timestamp.}
