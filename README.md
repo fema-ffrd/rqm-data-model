@@ -1,136 +1,126 @@
 # Risk Quantification Methodology (RQM) Data Model
 
-> Re-architecting deterministic building-loss inputs into first-class, **versioned distribution** objects for probabilistic flood risk assessment.
+> **NSI-Minimal Edition.** A focused, loadable schema for the National Structure Inventory, with first-class multi-geometry attach preserved for future building-footprint sources.
 
-**Version:** 0.1.0 &nbsp;|&nbsp; **License:** [MIT](LICENSE) &nbsp;|&nbsp; **Companion:** `fema-ffrd/inland-consequences` (SPHERE core schemas)
+**Version:** 0.2.0 &nbsp;|&nbsp; **License:** [MIT](LICENSE) &nbsp;|&nbsp; **Companion:** `fema-ffrd/inland-consequences`
 
 ## Overview
 
-Traditional flood-loss estimation treats each building input — flood depth, foundation
-type, first-floor height (FFH), and the depth-damage function (DDF) — as a single
-deterministic value. The RQM data model instead stores each uncertain input as a typed,
-versioned **distribution specification**. A sampling engine draws per-realization values
-from those specifications, propagating uncertainty end-to-end into Monte Carlo loss
-ensembles with reproducible provenance.
+This edition narrows the model to a tractable surface: a flat `buildings` table that maps every National Structure Inventory (NSI) parquet field one-to-one, and a `geometries` table that keeps geometry as its own class so a point from NSI and an alternate polygon footprint from Microsoft Building Footprints (MSBF) or FEMA USA Structures (USAS) can coexist without a schema break.
 
-This repository is the schema/data-model deliverable called for in the *Risk Assessment
-Maturity Roadmap* (Recommended Immediate Start Activity #1: "Develop data model/schema for
-Risk Assessment"). It realizes the roadmap's building-inventory design pillars —
-**Reproducible Models, Versioning, Components, Generics,** and **Parametric Distributions** —
-as a concrete, validated schema.
+A prior exploration on `feature/hybrid_data_model` built the full RQM wish list — 35 tables across seven domains covering attribute uncertainty, components, hazard links, depth-damage functions, loss realizations, provenance, bitemporal versioning, and export contracts. That exploration is preserved for reference at [data-dictionary/data-dictionary-full.yaml](data-dictionary/data-dictionary-full.yaml) and [diagrams/rqm-erd-full.mmd](diagrams/rqm-erd-full.mmd). The decisions behind the narrowing — and a concrete re-entry point for each deferred concept — are documented in [docs/decisions/ADR-nsi-minimal.md](docs/decisions/ADR-nsi-minimal.md).
 
-### Design goals
+### Design goals (v0.1)
 
-1. **Inventory / component coverage** — model structures and their damageable sub-components.
-2. **Uncertainty quantification** — replace scalar attributes with distribution objects.
-3. **Versioning / provenance** — every distribution, DDF, and run is reproducible and auditable.
+1. **Full NSI field coverage.** Every column in the NSI parquet lands in a table column with the NSI name preserved. Nothing is silently dropped.
+2. **Loadable and queryable.** The schema runs under Apache Sedona on PySpark against Apache Iceberg storage. An ingest script and a pytest smoke-test suite exercise the schema end-to-end against a real sample.
+3. **One architectural idea worth keeping.** `geometries` stays a first-class table so alternate footprint sources can attach without a migration.
 
-## Storage-tier architecture
-
-Storage tiers are inherited from the FFRD data model, each chosen for a distinct workload:
+## Storage + engine
 
 | Tier | Technology | Role |
 |---|---|---|
-| **Relational** | PostgreSQL | Inventory, distribution specs, DDF/event registries, results metadata, provenance |
-| **Lakehouse** | Apache Iceberg | Ensemble-scale realization draws & aggregates (schema evolution, time-travel) |
-| **Gridded** | Icechunk / Zarr | N-dimensional gridded hazard fields, referenced by versioned URI |
+| **Lakehouse** | Apache Iceberg | Versioned storage for `buildings` and `geometries` |
+| **Query engine** | Apache Sedona on PySpark 3.5+ | SQL, `ST_*` geometry functions, batch ingest |
+
+Primary and foreign keys are logical (Iceberg does not enforce them). The ingest script and the smoke tests enforce the invariants listed in the ADR.
 
 ## Data model
 
-The model is organized into six domains. Tables are defined once in
-[data-dictionary/data-dictionary.yaml](data-dictionary/data-dictionary.yaml) (the single
-source of truth) and rendered to
-[data-dictionary/data-dictionary.md](data-dictionary/data-dictionary.md).
+Two tables. One FK edge. See [data-dictionary/data-dictionary.md](data-dictionary/data-dictionary.md) for the generated field reference and [diagrams/rqm-erd.mmd](diagrams/rqm-erd.mmd) for the ERD.
 
-| Domain | Purpose | Key tables |
+| Table | Purpose | Rows per NSI load |
 |---|---|---|
-| **A — Inventory** | Structure & component coverage | `buildings`, `building_components`, `generics` |
-| **B — Attribute Uncertainty** | Distribution specs for uncertain attributes | `attribute_distributions`, `foundation_pmf` |
-| **C — Hazard Linkage** | Events and probabilistic flood depth | `events`, `hazard_links` |
-| **D — Depth-Damage Functions** | Versioned, probabilistic DDFs | `ddf_library`, `ddf_uncertainty` |
-| **E — Realization & Loss Results** | Ensemble-scale draws & summaries | `loss_realizations`, `mv_loss_summary` |
-| **F — Provenance & Versioning** | Reproducibility & lineage | `run_catalog`, `manifests`, `run_logs`, `versioning` |
+| `buildings` | One row per NSI structure; all 46 NSI parquet columns mapped 1:1 | one per structure |
+| `geometries` | First-class geometry registry (point + optional footprints + alternates) | one `role='point'` row per structure at load; additional rows added later for footprint sources |
 
 ### How the pieces fit together
 
-- **`buildings`** anchors the inventory. Immutable/base attributes live here; *uncertain*
-  attributes do not — they live in **`attribute_distributions`** and are resolved per draw.
-- **`building_components`** decomposes a structure into modular sub-assemblies (finish,
-  foundation, structure, contents, inventory), typed by the extensible **`generics`**
-  vocabulary so non-building inventories can be added without a schema break.
-- **`foundation_pmf`** captures the "shuffled" foundation type as an explicit probability
-  mass function plus a reproducible shuffle policy.
-- **`events`** is the canonical registry of hazard scenarios; its `event_id` is referenced
-  by `run_catalog`, `hazard_links`, and `loss_realizations`.
-- **`hazard_links`** ties a structure to a versioned gridded depth surface (Icechunk/Zarr)
-  and its depth-in-structure uncertainty, rather than copying a scalar depth into the row.
-- **`ddf_library` / `ddf_uncertainty`** make the DDF itself a distribution: a realization
-  draws a DDF percentile instead of a single mean curve.
-- **`loss_realizations`** (Iceberg) holds one row per building × event/AEP × Monte Carlo
-  draw, each reproducible from its `seed` plus version pointers; **`mv_loss_summary`**
-  pre-computes central tendency and upper prediction limits.
-- **`versioning`** is the central lineage registry applied to every distribution, PMF, DDF,
-  event, and inventory snapshot.
+- **`buildings`** is the flat inventory projection. NSI field names (`occtype`, `num_story`, `val_struct`, `pop2amu65`, `firmzone`, `cbfips`, …) are preserved verbatim so queries line up with the raw parquet. A surrogate `building_id` is the primary key; `fd_id` is the external natural key.
+- **`geometries`** carries one row per `(building, representation, alternate)` tuple. The NSI load creates exactly one row per structure with `role='point'`, `purpose='computation'`, `is_selected_for_export=true`, `crs='EPSG:3857'`, and `geom` holding the WKB point from the NSI `shape` column. Later, a footprint load (MSBF or USAS) writes additional rows with `role='footprint'`; a selection migration flips `is_selected_for_export` as needed.
+- **Enums** for `occtype`, `st_damcat`, `found_type`, `geometry_role`, and `geometry_purpose` are inlined in the YAML rather than normalized into lookup tables. NSI already publishes stable short codes; a lookup table adds nothing until per-code metadata (RSMeans rates, fragility curves) is actually needed, and adding one later is additive.
 
-### Entity-relationship diagram
+### Deferred concepts (re-entry map)
 
-The ERD is maintained in [diagrams/rqm-erd.mmd](diagrams/rqm-erd.mmd) (Mermaid). It is an
-abridged view — it shows keys and relationships, not every column. Refer to the data
-dictionary for the authoritative column list. GitHub renders `.mmd` files automatically;
-locally you can preview it with any Mermaid-capable viewer.
+Each deferred concept has a concrete re-entry point on this schema so reintroducing it is additive, not a rewrite. See [ADR-nsi-minimal §Deferrals](docs/decisions/ADR-nsi-minimal.md#deferrals-and-re-entry-map) for the full table; the short form:
+
+- **Attribute uncertainty** → `uncertainty_ref` with `consumer_type='buildings'`.
+- **Components + connections** → FK on `buildings.building_id`.
+- **Hazard links + events** → FK on `buildings.building_id`; events standalone.
+- **DDF library + DDF uncertainty** → keyed on `occtype` + `found_type` enums.
+- **Loss realizations** → Iceberg table keyed on `building_id` + `event_id` + `realization_id`.
+- **Provenance registry (PROV-O)** → soft refs on `buildings.source` and `geometries.source_ref` seed it.
+- **Bitemporal identity + branching** → add `asset_id` to `buildings`; bundle five supporting tables.
+- **Export contracts** → separate `exports` domain.
+- **3D geometry roles + component-level geometry** → extend `geometries.role` enum; add optional `component_id` FK.
 
 ## Repository structure
 
 ```
 rqm-data-model/
 ├── data-dictionary/
-│   ├── data-dictionary.yaml   # single source of truth (tables, columns, enums, FKs)
-│   ├── data-dictionary.md     # generated — do not edit by hand
-│   ├── preview_dict.py        # validates FKs and renders the Markdown
-│   └── requirements.txt       # generator dependencies (PyYAML)
+│   ├── data-dictionary.yaml       # single source of truth (NSI-minimal)
+│   ├── data-dictionary.md         # generated — do not edit by hand
+│   ├── data-dictionary-full.yaml  # archived hybrid exploration (reference only)
+│   ├── data-dictionary-full.md    # archived generated output
+│   ├── preview_dict.py            # validates + renders the Markdown
+│   └── requirements.txt           # generator deps (PyYAML)
 ├── diagrams/
-│   └── rqm-erd.mmd            # Mermaid entity-relationship diagram
+│   ├── rqm-erd.mmd                # Mermaid ERD (NSI-minimal)
+│   ├── rqm-erd-full.mmd           # archived hybrid ERD (reference only)
+│   └── pfrl-erd.png               # pre-rename PNG snapshot
 ├── docs/
-│   └── Risk_Assessment_Maturity_Roadmap - DRAFT.pdf   # source roadmap
+│   ├── decisions/
+│   │   └── ADR-nsi-minimal.md     # the decision behind this edition
+│   ├── user-stories/
+│   ├── building-standards-options/
+│   └── Risk_Assessment_Maturity_Roadmap - DRAFT.pdf
+├── tools/
+│   ├── ingest_nsi.py              # CLI: NSI parquet → Iceberg via Sedona
+│   ├── schema.sql                 # DDL for rqm.buildings + rqm.geometries
+│   └── requirements.txt           # PySpark, Sedona, Iceberg, pyarrow, pytest
+├── test/
+│   ├── conftest.py                # session-scoped Spark + ingest fixture
+│   ├── test_nsi_ingest.py         # smoke tests (ADR validation rules)
+│   └── data/
+│       ├── nsi.parquet            # sample NSI extract (46 cols, ~45k rows)
+│       └── README.md              # provenance of the sample
 └── LICENSE
 ```
 
 ## Regenerating the data dictionary
 
-The YAML is authoritative; the Markdown is generated. After editing the YAML, regenerate and
-validate in one step:
+The YAML is authoritative; the Markdown is generated.
 
 ```powershell
 pip install -r data-dictionary/requirements.txt
 python data-dictionary/preview_dict.py
 ```
 
-The generator validates that every PostgreSQL table has a primary key and that every foreign
-key points to an existing `table.column`, then writes `data-dictionary.md`. It exits non-zero
-on any validation failure, so it is safe to run in CI. Expected output:
+The generator validates that every table has a primary key and that every FK resolves. Expected output:
 
 ```
-OK: validated 15 tables, 132 columns. Wrote data-dictionary.md.
+OK: validated 2 tables, 57 columns. Wrote data-dictionary.md.
 ```
 
-## Roadmap alignment & maturity status
+## Running the ingest and smoke tests
 
-The model maps to the six workstreams of the *Risk Assessment Maturity Roadmap*. Coverage of
-each roadmap concept by the current schema:
+Requires Java 11 or 17 on PATH for PySpark 3.5.
 
-| Roadmap concept | Status | Realized by |
-|---|---|---|
-| Reproducible models | ✅ Covered | `run_catalog`, `manifests`, `run_logs`, `loss_realizations.seed` |
-| Versioning | ✅ Covered | `versioning` |
-| Components | ✅ Covered | `building_components` |
-| Generics (extensible inventory) | ✅ Covered | `generics` |
-| Uncertainty / parametric distributions | ✅ Covered | `attribute_distributions`, `foundation_pmf`, `ddf_uncertainty`, `hazard_links` |
-| DDF library & assignment | ✅ Covered | `ddf_library` |
-| Hazard / flood-depth linkage | ✅ Covered | `hazard_links`, `events` (+ Icechunk) |
-| Monte Carlo convergence criteria | 🟡 Partial | `run_catalog.n_realizations`, `mv_loss_summary.loss_cv` (no explicit convergence record) |
-| Coastal (wave / SWL / compound) | 🟡 Partial | `peril_type`, `hazard_links.velocity_grid_uri` / `duration_grid_uri` |
-| Global sensitivity analysis | 🟡 Partial | `run_type = sensitivity` only |
-| Decision uncertainty / BCA | ⚪ Downstream | Out of scope — consumed by BCA tooling |
+```powershell
+pip install -r tools/requirements.txt
+python tools/ingest_nsi.py --parquet test/data/nsi.parquet --warehouse test/warehouse
+pytest test/test_nsi_ingest.py -v
+```
+
+The ingest emits:
+
+```
+OK: ingested 45622 buildings, 45622 geometries from 45622 parquet rows
+into Iceberg warehouse at test/warehouse.
+```
+
+The test suite asserts the six validation rules from the ADR: field coverage, row-count parity, non-null `occtype`, geometry validity + `EPSG:3857`, selected-geometry uniqueness, and every-building-has-a-point. A non-asserting diagnostic prints NSI release completeness for `found_type`, `val_struct`, and `bldheight`.
 
 ## License
 
