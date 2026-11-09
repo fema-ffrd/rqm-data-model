@@ -11,6 +11,7 @@ venv/
 # Spark / Sedona / Iceberg scratch
 test/warehouse/
 test/warehouse-*/
+test/exports-*/
 spark-warehouse/
 derby.log
 metastore_db/
