@@ -1,0 +1,33 @@
+name: rqm-base
+channels:
+  - conda-forge
+dependencies:
+  - python=3.13
+  - numpy
+  - pandas
+  - scipy
+  - openpyxl
+  - geopandas
+  - shapely
+  - rasterio
+  - pyproj
+  - matplotlib
+  - notebook
+  - ipykernel
+  - pip
+  - pyarrow
+  - pytest
+  - pyyaml
+  - pyspark=3.5.*
+  - requests
+  - rioxarray
+  - ruff
+  - xarray
+  - zarr
+  - pip:
+    - pystac
+    - nbconvert
+    - leafmap
+    - python-dotenv
+    - stac_geoparquet
+    - "apache-sedona[spark]>=1.6.0"
