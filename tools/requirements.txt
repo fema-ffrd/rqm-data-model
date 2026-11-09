@@ -1,0 +1,13 @@
+# Ingest + smoke-test runtime for the NSI-minimal schema.
+# Apache Sedona on PySpark (local mode) reading/writing Iceberg tables.
+pyspark==3.5.*
+apache-sedona[spark]>=1.6.0
+pyarrow>=14.0
+pytest>=7.0
+pyyaml>=6.0
+
+# Notes
+# -----
+# Sedona pulls its Spark JARs via spark.jars.packages (declared in
+# tools/ingest_nsi.py and test/conftest.py), so no additional JAR is listed
+# here. Java 11 or 17 must be on PATH for PySpark 3.5.
