@@ -1,0 +1,79 @@
+%% =====================================================================
+%% Risk Quantification Methodology (RQM) Data Model — NSI-Minimal ERD
+%% Two Iceberg tables, one FK edge. Apache Sedona is the query engine.
+%%
+%% buildings  : one row per NSI structure; every NSI parquet column maps 1:1.
+%% geometries : first-class multi-geometry attach (ADR-geometry preserved).
+%%              Point for role='point', Polygon/MultiPolygon for role='footprint'.
+%%              NSI load creates one point row per building; alternate
+%%              footprint sources (MSBF, USAS) land as additional rows.
+%%
+%% The previous 35-table hybrid ERD is preserved at diagrams/rqm-erd-full.mmd.
+%% Deferred domains (uncertainty, hazard, DDF, loss realizations, exports,
+%% provenance, bitemporal versioning) and their re-entry points are documented
+%% in docs/decisions/ADR-nsi-minimal.md.
+%% =====================================================================
+erDiagram
+
+  buildings {
+    bigint      building_id PK
+    bigint      fd_id
+    bigint      bid
+    varchar     usastrucid
+    varchar     ftprntid
+    varchar     ftprntsrc
+    varchar     source
+    varchar     occtype
+    varchar     st_damcat
+    varchar     bldgtype
+    smallint    num_story
+    double      sqft
+    double      ftprntsqft
+    real        bldheight
+    smallint    med_yr_blt
+    varchar     found_type
+    real        found_ht
+    double      val_struct
+    double      val_cont
+    double      val_vehic
+    double      ornl_low
+    double      ornl_med
+    double      ornl_hgh
+    real        resunits
+    real        novehprob
+    real        vehperunit
+    real        pop2amu65
+    real        pop2amo65
+    real        pop2pmu65
+    real        pop2pmo65
+    real        u65disable
+    real        o65disable
+    real        students
+    varchar     firmzone
+    varchar     zone_sub
+    real        static_bfe
+    real        ground_elv
+    real        grnd_elv_m
+    real        pctlowclr
+    real        fullrep
+    real        depindex
+    real        creprcnt
+    integer     crerank
+    varchar     cbfips
+    timestamp   ingested_at
+  }
+
+  geometries {
+    bigint      geometry_id PK
+    bigint      building_id FK
+    varchar     role
+    varchar     purpose
+    boolean     is_selected_for_export
+    varchar     alt_group_key
+    varchar     source_ref
+    varchar     crs
+    geometry    geom
+    timestamp   ingested_at
+  }
+
+  buildings ||--o{ geometries : "has 1..N representations"
