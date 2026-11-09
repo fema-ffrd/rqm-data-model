@@ -71,6 +71,8 @@ Flat NSI inventory projection. Every NSI parquet column maps 1:1 to a column on 
 | `creprcnt` | real |  |  | NSI community-resilience percent indicator. |
 | `crerank` | integer |  |  | NSI community-resilience rank. |
 | `cbfips` | varchar(15) |  |  | Census block GEOID (15-digit FIPS) for community-level aggregation. |
+| `x` | double |  |  | NSI structure X coordinate (EPSG:3857). Denormalized from `shape` for query convenience. |
+| `y` | double |  |  | NSI structure Y coordinate (EPSG:3857). Denormalized from `shape` for query convenience. |
 | `ingested_at` | timestamp |  | NOT NULL | Row insertion timestamp (serves as the v0.1 version history until bitemporal versioning returns). |
 
 ### `geometries`

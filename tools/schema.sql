@@ -60,6 +60,8 @@ CREATE TABLE IF NOT EXISTS rqm.buildings (
     creprcnt      FLOAT              COMMENT 'NSI community-resilience percent.',
     crerank       INT                COMMENT 'NSI community-resilience rank.',
     cbfips        STRING             COMMENT 'Census block GEOID (15-digit FIPS).',
+    x             DOUBLE             COMMENT 'NSI X coordinate (EPSG:3857); denormalized from shape.',
+    y             DOUBLE             COMMENT 'NSI Y coordinate (EPSG:3857); denormalized from shape.',
     ingested_at   TIMESTAMP NOT NULL COMMENT 'Row insertion timestamp.'
 ) USING iceberg;
 

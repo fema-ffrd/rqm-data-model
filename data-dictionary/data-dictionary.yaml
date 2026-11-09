@@ -155,6 +155,8 @@ tables:
       - {name: creprcnt,     type: real,         nullable: true,  description: NSI community-resilience percent indicator.}
       - {name: crerank,      type: integer,      nullable: true,  description: NSI community-resilience rank.}
       - {name: cbfips,       type: varchar(15),  nullable: true,  description: Census block GEOID (15-digit FIPS) for community-level aggregation.}
+      - {name: x,            type: double,       nullable: true,  description: NSI structure X coordinate (EPSG:3857). Denormalized from `shape` for query convenience.}
+      - {name: y,            type: double,       nullable: true,  description: NSI structure Y coordinate (EPSG:3857). Denormalized from `shape` for query convenience.}
       - {name: ingested_at,  type: timestamp,    nullable: false, description: Row insertion timestamp (serves as the v0.1 version history until bitemporal versioning returns).}
 
   geometries:

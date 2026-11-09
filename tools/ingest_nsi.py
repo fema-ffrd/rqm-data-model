@@ -62,7 +62,7 @@ BUILDINGS_COLUMNS: list[str] = [
     "u65disable", "o65disable", "students",
     "firmzone", "zone_sub", "static_bfe", "ground_elv", "grnd_elv_m",
     "pctlowclr", "fullrep", "depindex", "creprcnt", "crerank",
-    "cbfips", "ingested_at",
+    "cbfips", "x", "y", "ingested_at",
 ]
 
 # All NSI parquet columns the schema maps (every column except `shape`).
@@ -76,6 +76,7 @@ NSI_SCALAR_FIELDS: list[str] = [
     "u65disable", "o65disable", "students",
     "firmzone", "zone_sub", "static_bfe", "ground_elv", "grnd_elv_m",
     "pctlowclr", "fullrep", "depindex", "creprcnt", "crerank", "cbfips",
+    "x", "y",
 ]
 
 # Target types for the write; cast to these from the raw NSI parquet types
@@ -97,6 +98,7 @@ BUILDINGS_CAST: dict[str, str] = {
     "pctlowclr": "float", "fullrep": "float", "depindex": "float",
     "creprcnt": "float", "crerank": "int",
     "cbfips": "string",
+    "x": "double", "y": "double",
 }
 
 

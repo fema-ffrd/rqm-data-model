@@ -18,7 +18,7 @@ Two critiques of that exploration drove this ADR:
 1. **Too broad to prototype.** Seven domains and 35 tables is more surface area than any single engineer can stand up or load real data into on a reasonable timeline. The paper schema was difficult to validate against anything concrete.
 2. **Over-normalized.** Subtype/supertype splits where only one subclass is populated (`generics` + `generic_building_component`; `uncertainty_spec` + three subtype tables); identity/branching tables that join with no payload (`asset` + `asset_revision` + `inventory_branch` + `revision_log` + `versioning`); a five-table W3C PROV-O profile for a single-source batch load.
 
-The actionable goal: **ingest the real NSI parquet (`test/data/nsi.parquet`, 44 columns, EPSG:3857) into a schema that supports real test cases**, while preserving the one piece of the hybrid design that is genuinely load-bearing for future work — first-class multiple geometries per structure so a point from NSI and a polygon footprint from Microsoft Building Footprints or FEMA USA Structures can co-exist without a schema break.
+The actionable goal: **ingest the real NSI parquet (`test/data/nsi.parquet`, 46 columns, EPSG:3857) into a schema that supports real test cases**, while preserving the one piece of the hybrid design that is genuinely load-bearing for future work — first-class multiple geometries per structure so a point from NSI and a polygon footprint from Microsoft Building Footprints or FEMA USA Structures can co-exist without a schema break.
 
 ## Decision
 
