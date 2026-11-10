@@ -14,3 +14,36 @@ Other requirements:
 1. An environment file (env.yaml) is required placed in the root folder of the  
 project for a reproducible python environment to be succussfully built.
 2. docker installed on the local machine (linux)
+
+## Large data (`RQM_DATA_DIR`)
+
+When the repository is cloned on a Windows drive, the workspace is bind-mounted
+over 9p, which reads at roughly 70 MB/s. The devcontainer therefore mounts a
+Docker named volume, `rqm-data`, at `/data` and sets `RQM_DATA_DIR=/data/rqm`.
+The volume lives on the Linux side and persists across container rebuilds.
+Keep large NSI inputs, Iceberg warehouses, and exports there:
+
+```
+/data/rqm/
+├── data/nsi2026_public_wkb.parquet   # nationwide NSI input
+├── warehouse-notebook/               # Iceberg warehouse (nsi_demo.ipynb)
+├── exports-notebook/                 # analysis-ready exports
+└── versioning-notebook/              # nsi_versioning_demo.ipynb scratch (recreated each run)
+```
+
+After the first rebuild with the volume, copy the nationwide file in once
+(the source can then be removed from the Windows drive):
+
+```bash
+cp test/data/nsi2026_public_wkb.parquet "$RQM_DATA_DIR/data/"
+```
+
+`notebooks/nsi_demo.ipynb` reads from `RQM_DATA_DIR` automatically. For the CLI,
+pass volume paths explicitly:
+
+```bash
+python tools/ingest_nsi.py \
+    --parquet "$RQM_DATA_DIR/data/nsi2026_public_wkb.parquet" \
+    --warehouse "$RQM_DATA_DIR/warehouse" \
+    --conf spark.driver.memory=8g
+```

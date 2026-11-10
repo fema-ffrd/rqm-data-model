@@ -14,22 +14,31 @@
 -- enforced by the ingest script + smoke tests. Column names, types, and order
 -- mirror data-dictionary/data-dictionary.yaml.
 -- =============================================================================
--- The `rqm.` prefix is the Iceberg catalog itself; tables live at the catalog
--- root, so no CREATE NAMESPACE is needed (and one would run against Spark's
--- session catalog, not the Iceberg catalog).
+-- Every table lives in the `inventory` namespace of the Iceberg catalog `rqm`
+-- (REST catalogs reject tables at the catalog root). `apply_schema` rewrites
+-- the `rqm.inventory` prefix to the configured catalog and namespace. The
+-- CREATE NAMESPACE is catalog-qualified, so it runs against the Iceberg
+-- catalog rather than Spark's session catalog.
+--
+-- buildings and geometries use merge-on-read row-level writes: a versioned
+-- re-ingest (MERGE) or edit records Iceberg v3 deletion vectors instead of
+-- rewriting whole data files, so each version stores only what changed.
+-- Versions themselves are Iceberg tags; see docs/decisions/ADR-versioning.md.
 -- =============================================================================
+
+CREATE NAMESPACE IF NOT EXISTS rqm.inventory;
 
 -- -----------------------------------------------------------------------------
 -- buildings: one row per NSI structure, every parquet field mapped 1:1.
 -- -----------------------------------------------------------------------------
-CREATE TABLE IF NOT EXISTS rqm.buildings (
+CREATE TABLE IF NOT EXISTS rqm.inventory.buildings (
     building_id   BIGINT    NOT NULL COMMENT 'Stable PK; set to the NSI fd_id at ingest.',
     fd_id         BIGINT             COMMENT 'NSI structure id (external natural key; source of building_id).',
     bid           STRING             COMMENT 'NSI building id (UBID, e.g. 8645XMJC+QG9-2-2-3-1).',
     usastrucid    STRING             COMMENT 'FEMA USA Structures id.',
     ftprntid      STRING             COMMENT 'Footprint id as reported by NSI.',
     ftprntsrc     STRING             COMMENT 'Footprint source tag.',
-    source        STRING             COMMENT 'NSI release tag.',
+    source        STRING             COMMENT 'NSI per-structure source code (e.g. P, H); prefixes geometries.source_ref.',
     occtype       STRING    NOT NULL COMMENT 'Occupancy code (enum occtype).',
     st_damcat     STRING             COMMENT 'Damage category (enum st_damcat).',
     bldgtype      STRING             COMMENT 'Construction class (W1, M1, S1, ...).',
@@ -69,17 +78,22 @@ CREATE TABLE IF NOT EXISTS rqm.buildings (
     cbfips        STRING             COMMENT 'Census block GEOID (15-digit FIPS).',
     x             DOUBLE             COMMENT 'NSI X coordinate (EPSG:3857); denormalized from shape.',
     y             DOUBLE             COMMENT 'NSI Y coordinate (EPSG:3857); denormalized from shape.',
-    ingested_at   TIMESTAMP NOT NULL COMMENT 'Row insertion timestamp.'
+    ingested_at   TIMESTAMP NOT NULL COMMENT 'When this row was last written (insert, or update by a load that changed it).'
 ) USING iceberg
-TBLPROPERTIES ('format-version' = '3');
+TBLPROPERTIES (
+    'format-version'    = '3',
+    'write.delete.mode' = 'merge-on-read',
+    'write.update.mode' = 'merge-on-read',
+    'write.merge.mode'  = 'merge-on-read'
+);
 
 -- -----------------------------------------------------------------------------
 -- geometries: first-class geometry. One row per (building, representation,
 -- alternate). NSI load creates one row per structure with role='point'.
 -- -----------------------------------------------------------------------------
-CREATE TABLE IF NOT EXISTS rqm.geometries (
+CREATE TABLE IF NOT EXISTS rqm.inventory.geometries (
     geometry_id            BIGINT    NOT NULL COMMENT 'Stable PK: xxhash64 of (source_ref, building_id, role, purpose, alt_group_key); same id on every re-ingest.',
-    building_id            BIGINT    NOT NULL COMMENT 'FK -> rqm.buildings.building_id (logical).',
+    building_id            BIGINT    NOT NULL COMMENT 'FK -> buildings.building_id (logical).',
     role                   STRING    NOT NULL COMMENT 'point | footprint.',
     purpose                STRING    NOT NULL COMMENT 'computation | hazard_sampling | display | qc.',
     is_selected_for_export BOOLEAN   NOT NULL COMMENT 'Exactly one TRUE per (building_id, purpose=computation).',
@@ -87,6 +101,50 @@ CREATE TABLE IF NOT EXISTS rqm.geometries (
     source_ref             STRING             COMMENT 'Source dataset identifier.',
     crs                    STRING    NOT NULL COMMENT 'EPSG string for the geometry in this row; must equal the geom column CRS (EPSG:3857).',
     geom                   GEOMETRY(3857) NOT NULL COMMENT 'Native Iceberg v3 geometry, EPSG:3857. Sedona reads via ST_GeomFromWKB(spark_st_asbinary(geom)); writes via spark_st_setsrid(spark_st_geomfromwkb(wkb), 3857).',
-    ingested_at            TIMESTAMP NOT NULL COMMENT 'Row insertion timestamp.'
+    ingested_at            TIMESTAMP NOT NULL COMMENT 'When this row was last written (insert, or update by a load that changed it).'
+) USING iceberg
+TBLPROPERTIES (
+    'format-version'    = '3',
+    'write.delete.mode' = 'merge-on-read',
+    'write.update.mode' = 'merge-on-read',
+    'write.merge.mode'  = 'merge-on-read'
+);
+
+-- -----------------------------------------------------------------------------
+-- inventory_versions: version registry. One row per named inventory version.
+-- The version name is also an Iceberg tag on buildings and geometries pointing
+-- at the recorded snapshots. The row is written last, so a version exists only
+-- once it is registered; tags without a row are leftovers of a failed commit.
+-- -----------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS rqm.inventory.inventory_versions (
+    version_name           STRING    NOT NULL COMMENT 'PK; also the Iceberg tag name on buildings and geometries.',
+    parent_version         STRING             COMMENT 'Version this one was derived from (NULL for a root load); for merges, the previous version on the target branch.',
+    merged_version         STRING             COMMENT 'For kind=merge: the branch version merged in.',
+    branch                 STRING    NOT NULL COMMENT 'Iceberg branch the version was committed on (main or a project branch).',
+    kind                   STRING    NOT NULL COMMENT 'release | edit | merge (enum version_kind).',
+    source_uri             STRING             COMMENT 'Input file loaded for this version (NULL for in-place edits and merges).',
+    source_sha256          STRING             COMMENT 'SHA-256 of the input file.',
+    editor                 STRING    NOT NULL COMMENT 'Who committed the version.',
+    reason                 STRING             COMMENT 'Why the version was committed.',
+    buildings_snapshot_id  BIGINT    NOT NULL COMMENT 'Iceberg snapshot of buildings tagged with version_name.',
+    geometries_snapshot_id BIGINT    NOT NULL COMMENT 'Iceberg snapshot of geometries tagged with version_name.',
+    n_buildings            BIGINT    NOT NULL COMMENT 'Buildings in the version.',
+    n_added                BIGINT    NOT NULL COMMENT 'Buildings added relative to parent_version (all of them for a root).',
+    n_removed              BIGINT    NOT NULL COMMENT 'Buildings removed relative to parent_version.',
+    n_changed              BIGINT    NOT NULL COMMENT 'Buildings whose attributes or computation point changed relative to parent_version.',
+    created_at             TIMESTAMP NOT NULL COMMENT 'When the version was committed (record time).'
+) USING iceberg
+TBLPROPERTIES ('format-version' = '3');
+
+-- -----------------------------------------------------------------------------
+-- inventory_changes: per-building change log. One row per building that a
+-- version added, removed, or modified relative to its parent_version. Root
+-- versions have no rows (every building in them is new).
+-- -----------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS rqm.inventory.inventory_changes (
+    version_name    STRING        NOT NULL COMMENT 'FK -> inventory_versions.version_name.',
+    building_id     BIGINT        NOT NULL COMMENT 'FK -> buildings.building_id (logical; the row may be gone in later versions).',
+    change_kind     STRING        NOT NULL COMMENT 'added | removed | modified (enum change_kind).',
+    changed_columns ARRAY<STRING>          COMMENT 'For modified: buildings columns that changed, plus geom when the selected computation point moved.'
 ) USING iceberg
 TBLPROPERTIES ('format-version' = '3');

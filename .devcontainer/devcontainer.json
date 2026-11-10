@@ -23,8 +23,15 @@
 		"PROJ_LIB": "/opt/conda/envs/rqm-base/share/proj",
 		"PROJ_DATA": "/opt/conda/envs/rqm-base/share/proj",
 		"GDAL_DATA": "/opt/conda/envs/rqm-base/share/gdal",
-		"JAVA_HOME": "/usr/lib/jvm/java-17-openjdk-amd64"
+		"JAVA_HOME": "/usr/lib/jvm/java-17-openjdk-amd64",
+		"RQM_DATA_DIR": "/data/rqm"
 	},
+	// Large NSI inputs, Iceberg warehouses, and exports live on a Linux named
+	// volume: the workspace bind mount from a Windows drive (9p) is several
+	// times slower. The volume persists across container rebuilds.
+	"mounts": [
+		"source=rqm-data,target=/data,type=volume"
+	],
 	// "runArgs": [
 	// 	"--gpus",
 	// 	"all"
@@ -42,8 +49,8 @@
 			}
 		}
 	},
-	// be sure to have the workspace folder owned by vscode user
-	"postCreateCommand": "sudo chown -R vscode:vscode ${containerWorkspaceFolder}",
+	// be sure to have the workspace folder and the data volume owned by vscode user
+	"postCreateCommand": "sudo chown -R vscode:vscode ${containerWorkspaceFolder} && sudo mkdir -p /data/rqm/data && sudo chown -R vscode:vscode /data/rqm && sudo chown vscode:vscode /data",
 	// start the dev container with the mtools-base environment activated
 	// avoid dubious ownership of the workspace folder https://www.kenmuse.com/blog/avoiding-dubious-ownership-in-dev-containers/
 	"postStartCommand": "micromamba shell init --shell=bash && echo 'micromamba activate rqm-base' >> ~/.bashrc && git config --global --add safe.directory ${containerWorkspaceFolder}"

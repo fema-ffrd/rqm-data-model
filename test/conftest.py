@@ -3,8 +3,10 @@ seeded with the NSI sample parquet.
 
 The session is created once per pytest session (expensive to start Spark)
 and the ingest runs once against a scratch warehouse under
-`test/warehouse-pytest/`. Individual tests get a ready-to-query
-`(spark, catalog)` tuple.
+`test/warehouse-pytest/` (default JDBC catalog: a SQLite `catalog.db` in the
+warehouse). Individual tests get a ready-to-query `(spark, prefix)` tuple,
+where `prefix` is `<catalog>.<namespace>` (`rqm.inventory`), so
+`f"{prefix}.buildings"` names a table.
 """
 
 from __future__ import annotations
@@ -34,18 +36,17 @@ def nsi_parquet() -> Path:
 
 
 @pytest.fixture(scope="session")
-def ingested_spark(nsi_parquet: Path):
-    """Boot Spark + Sedona, create the Iceberg tables, load the NSI sample."""
+def spark_session():
+    """One Spark + Sedona session for the whole run (catalog `rqm` -> WAREHOUSE).
+
+    Other test modules add catalogs to this session (Spark's packages and
+    driver classpath are fixed when the JVM starts, so a second session
+    could not differ anyway).
+    """
     pytest.importorskip("pyspark")
     pytest.importorskip("sedona")
 
-    from ingest_nsi import (  # type: ignore[import-not-found]
-        SparkSettings,
-        apply_schema,
-        build_spark,
-        load_buildings,
-        load_geometries,
-    )
+    from ingest_nsi import SparkSettings, build_spark  # type: ignore[import-not-found]
 
     if WAREHOUSE.exists():
         shutil.rmtree(WAREHOUSE)
@@ -53,9 +54,22 @@ def ingested_spark(nsi_parquet: Path):
 
     spark = build_spark(SparkSettings(warehouse=WAREHOUSE, catalog=CATALOG))
     try:
-        apply_schema(spark, CATALOG)
-        load_buildings(spark, nsi_parquet, CATALOG)
-        load_geometries(spark, nsi_parquet, CATALOG)
-        yield spark, CATALOG
+        yield spark
     finally:
         spark.stop()
+
+
+@pytest.fixture(scope="session")
+def ingested_spark(spark_session, nsi_parquet: Path):
+    """Create the Iceberg tables and load the NSI sample into catalog `rqm`."""
+    from ingest_nsi import (  # type: ignore[import-not-found]
+        NAMESPACE,
+        apply_schema,
+        load_buildings,
+        load_geometries,
+    )
+
+    apply_schema(spark_session, CATALOG)
+    load_buildings(spark_session, nsi_parquet, CATALOG)
+    load_geometries(spark_session, nsi_parquet, CATALOG)
+    yield spark_session, f"{CATALOG}.{NAMESPACE}"

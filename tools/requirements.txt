@@ -3,11 +3,13 @@
 pyspark==4.1.*
 apache-sedona[spark]==1.9.1  # must match the Sedona JAR in tools/ingest_nsi.py
 pyarrow>=14.0
+numpy>=1.26
+shapely>=2.0  # versioning.make_modified_nsi (test / demo data)
 pytest>=7.0
 pyyaml>=6.0
 
 # Notes
 # -----
-# Sedona and Iceberg Spark JARs are pulled via spark.jars.packages (pinned in
-# tools/ingest_nsi.py), so no JAR is listed here. Native Iceberg v3 GEOMETRY
+# Sedona, Iceberg, and sqlite-jdbc (default JDBC catalog) JARs are pulled via
+# spark.jars.packages (pinned in tools/ingest_nsi.py), so no JAR is listed here. Native Iceberg v3 GEOMETRY
 # columns need Spark 4.1 + Iceberg >= 1.12. Java 17+ must be on PATH for PySpark 4.x.

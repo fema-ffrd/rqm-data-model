@@ -1,16 +1,20 @@
 %% =====================================================================
 %% Risk Quantification Methodology (RQM) Data Model — NSI-Minimal ERD
-%% Two Iceberg v3 tables, one FK edge. Apache Sedona is the query engine.
-%%
+%% Iceberg v3 tables in namespace rqm.inventory. Apache Sedona is the query engine.
+%% -
 %% buildings  : one row per NSI structure; every NSI parquet column maps 1:1.
 %% geometries : first-class multi-geometry attach (ADR-geometry preserved).
 %%              Point for role='point', Polygon/MultiPolygon for role='footprint'.
 %%              NSI load creates one point row per building; alternate
 %%              footprint sources (MSBF, USAS) land as additional rows.
-%%
+%% -
+%% inventory_versions : version registry. Each version_name is also an Iceberg
+%%                      tag on buildings + geometries (ADR-versioning).
+%% inventory_changes  : per-building change log of each version vs. its parent.
+%% -
 %% The previous 35-table hybrid ERD is preserved at diagrams/rqm-erd-full.mmd.
 %% Deferred domains (uncertainty, hazard, DDF, loss realizations, exports,
-%% provenance, bitemporal versioning) and their re-entry points are documented
+%% provenance, valid-time history) and their re-entry points are documented
 %% in docs/decisions/ADR-nsi-minimal.md.
 %% =====================================================================
 erDiagram
@@ -78,4 +82,35 @@ erDiagram
     timestamp   ingested_at
   }
 
+  inventory_versions {
+    varchar     version_name PK "= Iceberg tag"
+    varchar     parent_version FK
+    varchar     merged_version FK
+    varchar     branch
+    varchar     kind
+    varchar     source_uri
+    varchar     source_sha256
+    varchar     editor
+    varchar     reason
+    bigint      buildings_snapshot_id
+    bigint      geometries_snapshot_id
+    bigint      n_buildings
+    bigint      n_added
+    bigint      n_removed
+    bigint      n_changed
+    timestamp   created_at
+  }
+
+  inventory_changes {
+    varchar     version_name PK,FK
+    bigint      building_id PK,FK
+    varchar     change_kind
+    varchar[]   changed_columns
+  }
+
   buildings ||--o{ geometries : "has 1..N representations"
+  inventory_versions ||--o{ inventory_changes : "records changes vs. parent"
+  buildings ||--o{ inventory_changes : "changed in"
+  inventory_versions |o--o{ inventory_versions : "parent / merged"
+  inventory_versions ||..|{ buildings : "tags a snapshot of"
+  inventory_versions ||..|{ geometries : "tags a snapshot of"

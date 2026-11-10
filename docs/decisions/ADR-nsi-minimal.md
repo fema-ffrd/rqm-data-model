@@ -31,7 +31,7 @@ The actionable goal: **ingest the real NSI parquet (`test/data/nsi.parquet`, 46 
 
 ### Engine and storage
 
-- **Storage tier:** Apache Iceberg format-version 3 tables. `geometries.geom` uses the native v3 `GEOMETRY` type with a column-level CRS of EPSG:3857.
+- **Storage tier:** Apache Iceberg format-version 3 tables in the `inventory` namespace (`rqm.inventory.buildings`). `geometries.geom` uses the native v3 `GEOMETRY` type with a column-level CRS of EPSG:3857. The default catalog is Iceberg's JDBC catalog on a SQLite file in the warehouse; see [ADR-versioning](ADR-versioning.md) §7.
 - **Query engine:** Apache Sedona 1.9 on PySpark 4.1 (local mode for development and tests; the same `SparkSettings` target a cluster and a REST/Glue catalog). Spark 4.1 + Iceberg 1.12 is the first open-source stack that reads and writes v3 geometry columns. Sedona provides the `ST_*` function family; because Sedona shadows Spark's built-in geometry functions and only accepts its own geometry UDT, the ingest registers Spark's built-ins as `spark_st_*` and Sedona reads `geom` via `ST_GeomFromWKB(spark_st_asbinary(geom))`.
 - **Physical layout:** `buildings` is partitioned by state (`truncate(2, cbfips)`) and sorted by `cbfips`; `geometries` is unpartitioned. Layouts are configurable per table at creation (`TableLayout` in `tools/ingest_nsi.py`).
 - **Primary/foreign keys** are logical; Iceberg does not enforce them. Invariants are enforced by the ingest script and the smoke-test suite.
@@ -42,7 +42,7 @@ Occupancy, damage category, foundation type, and FIRM zone are inlined as `varch
 
 ### Identity and versioning
 
-`building_id` is the structure identity; it equals the NSI `fd_id`, so a structure keeps its id across re-ingests. `geometry_id` is likewise deterministic: the xxhash64 of the row's natural key `(source_ref, building_id, role, purpose, alt_group_key)`, so a geometry keeps its id across re-ingests and selection migrations, and the ingest refuses a write whose id collides with a different natural key. `ingested_at` is the entire version history. The hybrid branch's `asset` / `asset_revision` / `inventory_branch` / `revision_log` / `versioning` split is deferred.
+`building_id` is the structure identity; it equals the NSI `fd_id`, so a structure keeps its id across re-ingests. `geometry_id` is likewise deterministic: the xxhash64 of the row's natural key `(source_ref, building_id, role, purpose, alt_group_key)`, so a geometry keeps its id across re-ingests and selection migrations, and the ingest refuses a write whose id collides with a different natural key. Versioning is defined by [ADR-versioning](ADR-versioning.md): loads are MERGE upserts, named versions are Iceberg tags recorded in `inventory_versions`, and per-building changes are recorded in `inventory_changes`. `ingested_at` records when a row was last written. The hybrid branch's `asset` / `asset_revision` / `inventory_branch` / `revision_log` / `versioning` split is not needed while these ids are stable.
 
 ## Validation rules
 
@@ -76,7 +76,7 @@ Nothing from the hybrid exploration is lost — the full dictionary and ERD sit 
 | Depth-damage functions | `ddf_library`, `ddf_uncertainty` | No inventory dependency; keyed on `occtype` + `found_type` enums that already exist here. |
 | Loss realizations | `loss_realizations`, `mv_loss_summary` | Iceberg tables keyed on `building_id` + `event_id` + `realization_id`. No schema change to the core. |
 | Provenance registry | `prov_agent`, `prov_activity`, `source_registry`, `source_observation`, `adopted_value_link` | Soft references via `buildings.source` and `geometries.source_ref` seed the future registry. |
-| Bitemporal identity + branching | `asset`, `asset_revision`, `inventory_branch`, `revision_log`, `versioning` | Add `asset_id` to `buildings`; demote `building_id` to a current-head projection; add the five supporting tables as a bundle. `ingested_at` is replaced by the bitemporal quadruple. |
+| Bitemporal identity + branching | `asset`, `asset_revision`, `inventory_branch`, `revision_log`, `versioning` | **Resolved by [ADR-versioning](ADR-versioning.md):** Iceberg tags and branches plus `inventory_versions` / `inventory_changes`. Still deferred: valid time, and identity tables for non-NSI id schemes. |
 | Export contracts | `export_contract`, `export_product`, `export_lossiness_report` | Return as a separate `exports` domain; discriminator enum re-adds `'buildings'` and `'geometries'`. |
 | 3D geometry roles + component-level geometry | `geometries.role` 3D values, `geometries.component_id` | Role enum extends to include `envelope_3d` / `detailed_3d`; add an optional `component_id` FK once `building_components` lands. |
 

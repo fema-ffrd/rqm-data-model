@@ -72,10 +72,11 @@ def render(model):
         "support (ADR-geometry) preserved so additional footprint sources can be "
         "attached beside each NSI point without a schema break. Component "
         "decomposition, attribute uncertainty, hazard links, DDFs, loss "
-        "realizations, export contracts, provenance registry, and bitemporal "
-        "versioning are deferred; re-entry points are documented in "
-        "ADR-nsi-minimal. The previous full-coverage dictionary is preserved at "
-        "`data-dictionary-full.yaml`.\n"
+        "realizations, export contracts, provenance registry, and valid-time "
+        "(bitemporal) history are deferred; re-entry points are documented in "
+        "ADR-nsi-minimal. Inventory versions, branches, and the per-building "
+        "change log follow ADR-versioning. The previous full-coverage "
+        "dictionary is preserved at `data-dictionary-full.yaml`.\n"
     )
 
     # Table of contents

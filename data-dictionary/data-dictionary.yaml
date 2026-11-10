@@ -18,12 +18,17 @@
 #   iceberg -> relational, versioned Iceberg (format-version 3) tables accessed
 #              via Apache Sedona (Spark 4.1) for SQL, geometry (ST_*), and
 #              batch ingest. Geometry columns use the native Iceberg v3
-#              GEOMETRY type.
+#              GEOMETRY type. All tables live in the `inventory` namespace
+#              (rqm.inventory.<table>).
+#
+# Versioning (ADR-versioning): named inventory versions are Iceberg tags on
+# buildings + geometries, registered in inventory_versions, with per-building
+# changes in inventory_changes. Project inventories are Iceberg branches.
 # =============================================================================
 
 metadata:
   model_name: Risk Quantification Methodology (RQM) Data Model — NSI Minimal
-  version: 0.2.0
+  version: 0.3.0
   companion_repo: fema-ffrd/inland-consequences
   storage_tiers: [iceberg]
   query_engine: Apache Sedona (Spark 4.1)
@@ -92,6 +97,14 @@ enums:
     - hazard_sampling
     - display
     - qc
+  version_kind:
+    - release       # a new source dataset loaded in full
+    - edit          # in-place edits, or a revised copy of the dataset
+    - merge         # a branch merged into another branch
+  change_kind:
+    - added
+    - removed
+    - modified
 
 # -----------------------------------------------------------------------------
 # DOMAIN A — INVENTORY  (NSI structures + first-class geometry)
@@ -109,11 +122,14 @@ tables:
       source. Geometry lives in the `geometries` table (ADR-geometry
       preserved). Component decomposition, attribute uncertainty specs,
       hazard links, DDFs, loss realizations, export contracts, provenance
-      registry, and bitemporal versioning are all deferred; re-entry points
-      are documented in ADR-nsi-minimal. The primary key `building_id` is set
-      to the NSI `fd_id` at ingest so ids are stable across re-ingests; `fd_id`
-      is kept as the external natural key. Physical layout: partitioned by
-      state (Iceberg `truncate(2, cbfips)`) and sorted by `cbfips`.
+      registry, and valid-time (bitemporal) history are deferred; re-entry
+      points are documented in ADR-nsi-minimal. The primary key `building_id`
+      is set to the NSI `fd_id` at ingest so ids are stable across re-ingests
+      and versions; `fd_id` is kept as the external natural key. Loads MERGE
+      a full replacement into a branch; earlier states stay readable through
+      version tags (ADR-versioning). Physical layout: partitioned by state
+      (Iceberg `truncate(2, cbfips)`) and sorted by `cbfips`; merge-on-read
+      writes.
     columns:
       - {name: building_id,  type: bigint,       pk: true, nullable: false, description: 'Stable primary key; equals the NSI fd_id (logical identity; unique, asserted in smoke tests).'}
       - {name: fd_id,        type: bigint,       nullable: true,  description: NSI structure id (external natural key; source of building_id; logically UNIQUE where not null).}
@@ -121,7 +137,7 @@ tables:
       - {name: usastrucid,   type: varchar(32),  nullable: true,  description: FEMA USA Structures id (joins to USAS footprint source).}
       - {name: ftprntid,     type: varchar(64),  nullable: true,  description: Footprint id as reported by NSI (joins to geometries.source_ref when the footprint source is attached).}
       - {name: ftprntsrc,    type: varchar(32),  nullable: true,  description: Footprint source tag (MSBF, USAS, ...).}
-      - {name: source,       type: varchar(32),  nullable: true,  description: NSI release tag (e.g., NSI-2024.1); becomes geometries.source_ref prefix.}
+      - {name: source,       type: varchar(32),  nullable: true,  description: 'NSI per-structure source code (e.g., P, H); geometries.source_ref is NSI-<source>.'}
       - {name: occtype,      type: varchar(16),  nullable: false, description: Occupancy classification code (enum occtype; e.g., RES1, COM1).}
       - {name: st_damcat,    type: varchar(16),  nullable: true,  description: Structure damage category (enum st_damcat; RES, COM, IND, PUB, AGR).}
       - {name: bldgtype,     type: varchar(16),  nullable: true,  description: Construction class code (e.g., W1 wood light-frame, M1 masonry).}
@@ -161,7 +177,7 @@ tables:
       - {name: cbfips,       type: varchar(15),  nullable: true,  description: Census block GEOID (15-digit FIPS) for community-level aggregation.}
       - {name: x,            type: double,       nullable: true,  description: NSI structure X coordinate (EPSG:3857). Denormalized from `shape` for query convenience.}
       - {name: y,            type: double,       nullable: true,  description: NSI structure Y coordinate (EPSG:3857). Denormalized from `shape` for query convenience.}
-      - {name: ingested_at,  type: timestamp,    nullable: false, description: Row insertion timestamp (serves as the v0.1 version history until bitemporal versioning returns).}
+      - {name: ingested_at,  type: timestamp,    nullable: false, description: 'When this row was last written: its insert, or the last load or edit that changed it. Version history lives in Iceberg snapshots + inventory_versions.'}
 
   geometries:
     domain: inventory
@@ -179,9 +195,13 @@ tables:
       exactly one row per (building_id, purpose='computation') has
       is_selected_for_export=true at any time — enforced by the ingest script
       and smoke tests (Iceberg does not enforce UNIQUE). 3D roles,
-      component-level geometry, and bitemporal validity are deferred (see
-      ADR-nsi-minimal re-entry map). Physical layout: unpartitioned by
-      default (configurable via TableLayout in tools/ingest_nsi.py).
+      component-level geometry, and valid-time history are deferred (see
+      ADR-nsi-minimal re-entry map). Versioned together with buildings
+      (same tag per version). A reload never overwrites
+      is_selected_for_export, deletes only missing NSI rows, and deletes rows
+      from any source whose building is gone. Physical layout: unpartitioned
+      by default (configurable via TableLayout in tools/ingest_nsi.py);
+      merge-on-read writes.
     columns:
       - {name: geometry_id,            type: bigint,       pk: true, nullable: false, description: 'Stable primary key: xxhash64 of the natural key (source_ref, building_id, role, purpose, alt_group_key), so a geometry keeps its id across re-ingests and selection changes. The ingest refuses a write whose id collides with a different natural key.'}
       - {name: building_id,            type: bigint,       fk: buildings.building_id, nullable: false, description: Parent structure (logical FK; cascade behavior enforced by the ingest contract).}
@@ -192,4 +212,52 @@ tables:
       - {name: source_ref,             type: varchar(64),  nullable: true,  description: 'Source dataset identifier (e.g., NSI-2024.1, MSBF-2022-10, USAS-2024).'}
       - {name: crs,                    type: varchar(16),  nullable: false, description: 'EPSG string for this row''s geometry; must equal the geom column CRS (EPSG:3857), so alternates are reprojected on load.'}
       - {name: geom,                   type: geometry,     nullable: false, description: 'Native Iceberg v3 GEOMETRY(EPSG:3857); Point for role=''point'', Polygon/MultiPolygon for role=''footprint''. Sedona reads it via ST_GeomFromWKB(spark_st_asbinary(geom)).'}
-      - {name: ingested_at,            type: timestamp,    nullable: false, description: Row insertion timestamp.}
+      - {name: ingested_at,            type: timestamp,    nullable: false, description: 'When this row was last written (insert, or a load that changed its point or CRS).'}
+
+  inventory_versions:
+    domain: inventory
+    storage: iceberg
+    grain: One row per named inventory version.
+    description: >
+      Version registry (ADR-versioning). Each row names an immutable state of
+      the inventory: `version_name` is also an Iceberg tag on `buildings` and
+      `geometries` pointing at the recorded snapshots, so the version reads as
+      `SELECT … FROM rqm.inventory.buildings VERSION AS OF '<version_name>'`.
+      Records who committed it, why, from which input, on which branch, its
+      lineage (parent and merged versions), and change counts relative to the
+      parent. Written last when a version is committed, so a version exists
+      only once registered; a tag without a row is an incomplete commit.
+    columns:
+      - {name: version_name,           type: varchar(100), pk: true, nullable: false, description: 'Version name; also the Iceberg tag name. Letters, digits, ".", "_", "-".'}
+      - {name: parent_version,         type: varchar(100), fk: inventory_versions.version_name, nullable: true,  description: Version this one was derived from (NULL for a root load). For merges, the previous version of the target branch.}
+      - {name: merged_version,         type: varchar(100), fk: inventory_versions.version_name, nullable: true,  description: 'For kind=merge: the branch version merged in.'}
+      - {name: branch,                 type: varchar(100), nullable: false, description: Iceberg branch the version was committed on (main or a project branch).}
+      - {name: kind,                   type: varchar(16),  nullable: false, description: 'Enum version_kind: release, edit, or merge.'}
+      - {name: source_uri,             type: text,         nullable: true,  description: Input file loaded for the version (NULL for in-place edits and merges).}
+      - {name: source_sha256,          type: varchar(64),  nullable: true,  description: SHA-256 of the input file.}
+      - {name: editor,                 type: varchar(100), nullable: false, description: Who committed the version (RQM-16).}
+      - {name: reason,                 type: text,         nullable: true,  description: Why the version was committed (RQM-16).}
+      - {name: buildings_snapshot_id,  type: bigint,       nullable: false, description: Iceberg snapshot of buildings tagged with version_name.}
+      - {name: geometries_snapshot_id, type: bigint,       nullable: false, description: Iceberg snapshot of geometries tagged with version_name.}
+      - {name: n_buildings,            type: bigint,       nullable: false, description: Buildings in the version.}
+      - {name: n_added,                type: bigint,       nullable: false, description: Buildings added relative to parent_version (all of them for a root version).}
+      - {name: n_removed,              type: bigint,       nullable: false, description: Buildings removed relative to parent_version.}
+      - {name: n_changed,              type: bigint,       nullable: false, description: Buildings whose attributes or selected computation geometry changed relative to parent_version.}
+      - {name: created_at,             type: timestamp,    nullable: false, description: When the version was committed (record time).}
+
+  inventory_changes:
+    domain: inventory
+    storage: iceberg
+    grain: One row per (version, building) added, removed, or modified relative to the version's parent.
+    description: >
+      Per-building change log (ADR-versioning), attributed through
+      inventory_versions (editor, reason, created_at). Answers "which
+      versions changed building X, how, and who did it" without scanning
+      table history. Root versions have no rows; every building in them
+      counts as added. Counts per version equal the registry's n_added /
+      n_removed / n_changed.
+    columns:
+      - {name: version_name,    type: varchar(100),  pk: true, fk: inventory_versions.version_name, nullable: false, description: Version that made the change.}
+      - {name: building_id,     type: bigint,        pk: true, fk: buildings.building_id, nullable: false, description: Changed building (logical FK; a removed building is absent from the head but present in earlier versions).}
+      - {name: change_kind,     type: varchar(16),   nullable: false, description: 'Enum change_kind: added, removed, or modified.'}
+      - {name: changed_columns, type: 'varchar[]', nullable: true, description: 'For modified rows: the buildings columns that changed, plus geom when the selected computation geometry changed.'}

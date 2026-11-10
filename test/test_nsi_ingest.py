@@ -78,6 +78,53 @@ def test_field_coverage(nsi_parquet: Path) -> None:
     assert not missing, f"NSI columns expected but not present: {sorted(missing)}"
 
 
+def _write_geoparquet(path: Path, extra_columns: dict, covering: dict | None) -> Path:
+    import json
+
+    import pyarrow as pa
+
+    geo_column: dict = {"encoding": "WKB", "geometry_types": ["Point"]}
+    if covering is not None:
+        geo_column["covering"] = covering
+    table = pa.table({"fd_id": [1], "shape": [b"\x00"], **extra_columns})
+    geo = {
+        "version": "1.1.0",
+        "primary_column": "shape",
+        "columns": {"shape": geo_column},
+    }
+    table = table.replace_schema_metadata({"geo": json.dumps(geo)})
+    pq.write_table(table, path)
+    return path
+
+
+def test_coverage_check_ignores_geoparquet_covering(tmp_path: Path) -> None:
+    """GDAL's GeoParquet 1.1 `shape_bbox` covering is derived, not NSI drift."""
+    from ingest_nsi import (  # type: ignore[import-not-found]
+        diagnostic_coverage_check,
+        geoparquet_covering_columns,
+    )
+
+    bbox = {"xmin": 0.0, "ymin": 0.0, "xmax": 1.0, "ymax": 1.0}
+    covering = {"bbox": {k: ["shape_bbox", k] for k in bbox}}
+    path = _write_geoparquet(
+        tmp_path / "covered.parquet", {"shape_bbox": [bbox]}, covering
+    )
+    assert geoparquet_covering_columns(pq.read_schema(path)) == {"shape_bbox"}
+    assert diagnostic_coverage_check(path) == []
+
+
+def test_coverage_check_still_reports_undeclared_columns(tmp_path: Path) -> None:
+    """A bbox-looking column without covering metadata is still release drift."""
+    from ingest_nsi import diagnostic_coverage_check  # type: ignore[import-not-found]
+
+    path = _write_geoparquet(
+        tmp_path / "drift.parquet",
+        {"shape_bbox": [{"xmin": 0.0}], "new_field": [1]},
+        covering=None,
+    )
+    assert diagnostic_coverage_check(path) == ["new_field", "shape_bbox"]
+
+
 def test_buildings_row_count_matches_parquet(nsi_parquet: Path, ingested_spark) -> None:
     """Smoke query 1: buildings row count equals parquet row count."""
     spark, cat = ingested_spark
@@ -131,6 +178,11 @@ def test_tables_are_iceberg_v3_with_native_geometry(ingested_spark) -> None:
             for r in spark.sql(f"SHOW TBLPROPERTIES {cat}.{table}").collect()
         }
         assert props.get("format-version") == "3", f"{table}: {props}"
+        # Versioned loads and edits write deletion vectors, not file rewrites.
+        for mode in ("write.delete.mode", "write.update.mode", "write.merge.mode"):
+            assert props.get(mode) == "merge-on-read", (
+                f"{table}: {mode}={props.get(mode)}"
+            )
     geom_type = spark.table(f"{cat}.geometries").schema["geom"].dataType.simpleString()
     assert geom_type == "geometry(3857)", geom_type
 
@@ -324,6 +376,49 @@ def test_every_building_has_a_computation_point(ingested_spark) -> None:
         """
     ).count()
     assert missing == 0, f"{missing} buildings lack a selected computation point"
+
+
+def test_points_in_polygon_spatial_join(ingested_spark) -> None:
+    """A Sedona broadcast spatial join of geometries against a polygon (the
+    watershed subset in the demo export) returns exactly the points inside it.
+
+    Without the Sedona JARs on the driver classpath this fails with
+    IllegalAccessError while serializing the JTS index.
+    """
+    from ingest_nsi import sedona_geom_sql  # type: ignore[import-not-found]
+
+    spark, cat = ingested_spark
+    pts = f"{cat}.geometries"
+    # Inner half of the sample's extent, in EPSG:3857.
+    spark.sql(
+        f"""
+        SELECT ST_PolygonFromEnvelope(
+                   x0 + (x1 - x0) / 4, y0 + (y1 - y0) / 4,
+                   x1 - (x1 - x0) / 4, y1 - (y1 - y0) / 4) AS area
+        FROM (SELECT MIN(ST_X(p)) AS x0, MAX(ST_X(p)) AS x1,
+                     MIN(ST_Y(p)) AS y0, MAX(ST_Y(p)) AS y1
+              FROM (SELECT {sedona_geom_sql()} AS p FROM {pts}))
+        """
+    ).createOrReplaceTempView("test_area")
+
+    joined = spark.sql(
+        f"""
+        SELECT /*+ BROADCAST(a) */ g.building_id
+        FROM {pts} g JOIN test_area a ON ST_Contains(a.area, {sedona_geom_sql("g.geom")})
+        """
+    )
+    assert (
+        "BroadcastIndexJoin" in joined._jdf.queryExecution().executedPlan().toString()
+    )
+    expected = spark.sql(
+        f"""
+        SELECT COUNT(*) AS n
+        FROM (SELECT {sedona_geom_sql()} AS p FROM {pts}) CROSS JOIN test_area
+        WHERE ST_X(p) > ST_XMin(area) AND ST_X(p) < ST_XMax(area)
+          AND ST_Y(p) > ST_YMin(area) AND ST_Y(p) < ST_YMax(area)
+        """
+    ).collect()[0]["n"]
+    assert 0 < joined.count() == expected
 
 
 def test_diagnostic_missing_values(ingested_spark, capsys) -> None:
