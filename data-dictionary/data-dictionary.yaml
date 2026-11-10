@@ -15,8 +15,10 @@
 # for reference; diff against that file to see exactly what was deferred.
 #
 # Storage tier:
-#   iceberg -> relational, versioned Iceberg tables accessed via Apache Sedona
-#              (Spark 3.x) for SQL, geometry (ST_*), and batch ingest.
+#   iceberg -> relational, versioned Iceberg (format-version 3) tables accessed
+#              via Apache Sedona (Spark 4.1) for SQL, geometry (ST_*), and
+#              batch ingest. Geometry columns use the native Iceberg v3
+#              GEOMETRY type.
 # =============================================================================
 
 metadata:
@@ -24,7 +26,7 @@ metadata:
   version: 0.2.0
   companion_repo: fema-ffrd/inland-consequences
   storage_tiers: [iceberg]
-  query_engine: Apache Sedona (Spark 3.x)
+  query_engine: Apache Sedona (Spark 4.1)
   domains: [inventory]
 
 # -----------------------------------------------------------------------------
@@ -108,12 +110,14 @@ tables:
       preserved). Component decomposition, attribute uncertainty specs,
       hazard links, DDFs, loss realizations, export contracts, provenance
       registry, and bitemporal versioning are all deferred; re-entry points
-      are documented in ADR-nsi-minimal. The primary key `building_id` is a
-      surrogate generated at ingest; `fd_id` is the external natural key.
+      are documented in ADR-nsi-minimal. The primary key `building_id` is set
+      to the NSI `fd_id` at ingest so ids are stable across re-ingests; `fd_id`
+      is kept as the external natural key. Physical layout: partitioned by
+      state (Iceberg `truncate(2, cbfips)`) and sorted by `cbfips`.
     columns:
-      - {name: building_id,  type: bigint,       pk: true, nullable: false, description: Surrogate primary key (generated at ingest; logical identity).}
-      - {name: fd_id,        type: bigint,       nullable: true,  description: NSI structure id (external natural key; logically UNIQUE where not null).}
-      - {name: bid,          type: bigint,       nullable: true,  description: NSI block id.}
+      - {name: building_id,  type: bigint,       pk: true, nullable: false, description: 'Stable primary key; equals the NSI fd_id (logical identity; unique, asserted in smoke tests).'}
+      - {name: fd_id,        type: bigint,       nullable: true,  description: NSI structure id (external natural key; source of building_id; logically UNIQUE where not null).}
+      - {name: bid,          type: varchar(32),  nullable: true,  description: 'NSI building id (UBID — Open Location Code plus extents, e.g. 8645XMJC+QG9-2-2-3-1).'}
       - {name: usastrucid,   type: varchar(32),  nullable: true,  description: FEMA USA Structures id (joins to USAS footprint source).}
       - {name: ftprntid,     type: varchar(64),  nullable: true,  description: Footprint id as reported by NSI (joins to geometries.source_ref when the footprint source is attached).}
       - {name: ftprntsrc,    type: varchar(32),  nullable: true,  description: Footprint source tag (MSBF, USAS, ...).}
@@ -153,7 +157,7 @@ tables:
       - {name: fullrep,      type: real,         nullable: true,  description: NSI fullrep indicator (full-replacement flag or share).}
       - {name: depindex,     type: real,         nullable: true,  description: NSI dependency index.}
       - {name: creprcnt,     type: real,         nullable: true,  description: NSI community-resilience percent indicator.}
-      - {name: crerank,      type: integer,      nullable: true,  description: NSI community-resilience rank.}
+      - {name: crerank,      type: real,         nullable: true,  description: 'NSI community-resilience rank (fractional, 0-1).'}
       - {name: cbfips,       type: varchar(15),  nullable: true,  description: Census block GEOID (15-digit FIPS) for community-level aggregation.}
       - {name: x,            type: double,       nullable: true,  description: NSI structure X coordinate (EPSG:3857). Denormalized from `shape` for query convenience.}
       - {name: y,            type: double,       nullable: true,  description: NSI structure Y coordinate (EPSG:3857). Denormalized from `shape` for query convenience.}
@@ -168,22 +172,24 @@ tables:
       one geometric representation of a building. The NSI load produces
       exactly one row per structure with role='point',
       purpose='computation', is_selected_for_export=true, geom from the
-      parquet `shape` column (EPSG:3857). Alternate footprints (MSBF, USAS)
+      parquet `shape` column stored as a native Iceberg v3 GEOMETRY with a
+      column-level CRS of EPSG:3857. Alternate footprints (MSBF, USAS)
       land as additional rows with role='footprint' and may flip the
       selected flag via a separate selection migration. Logical invariant:
       exactly one row per (building_id, purpose='computation') has
       is_selected_for_export=true at any time — enforced by the ingest script
       and smoke tests (Iceberg does not enforce UNIQUE). 3D roles,
       component-level geometry, and bitemporal validity are deferred (see
-      ADR-nsi-minimal re-entry map).
+      ADR-nsi-minimal re-entry map). Physical layout: unpartitioned by
+      default (configurable via TableLayout in tools/ingest_nsi.py).
     columns:
-      - {name: geometry_id,            type: bigint,       pk: true, nullable: false, description: Surrogate primary key.}
+      - {name: geometry_id,            type: bigint,       pk: true, nullable: false, description: 'Stable primary key: xxhash64 of the natural key (source_ref, building_id, role, purpose, alt_group_key), so a geometry keeps its id across re-ingests and selection changes. The ingest refuses a write whose id collides with a different natural key.'}
       - {name: building_id,            type: bigint,       fk: buildings.building_id, nullable: false, description: Parent structure (logical FK; cascade behavior enforced by the ingest contract).}
       - {name: role,                   type: varchar(16),  nullable: false, description: 'Geometry role (enum geometry_role): point | footprint. 3D roles deferred.'}
       - {name: purpose,                type: varchar(16),  nullable: false, description: 'Why this representation exists (enum geometry_purpose): computation | hazard_sampling | display | qc.'}
       - {name: is_selected_for_export, type: boolean,      nullable: false, description: Exactly one TRUE per (building_id, purpose='computation') at any time (logical invariant; asserted in smoke tests).}
       - {name: alt_group_key,          type: varchar(64),  nullable: true,  description: Groups competing alternates at the same (building_id, role) — e.g., two footprints from different sources share a key.}
       - {name: source_ref,             type: varchar(64),  nullable: true,  description: 'Source dataset identifier (e.g., NSI-2024.1, MSBF-2022-10, USAS-2024).'}
-      - {name: crs,                    type: varchar(16),  nullable: false, description: EPSG string for this row's geometry (e.g., EPSG:3857 for NSI; alternates keep native CRS).}
-      - {name: geom,                   type: geometry,     nullable: false, description: Sedona geometry value; Point for role='point', Polygon/MultiPolygon for role='footprint'.}
+      - {name: crs,                    type: varchar(16),  nullable: false, description: 'EPSG string for this row''s geometry; must equal the geom column CRS (EPSG:3857), so alternates are reprojected on load.'}
+      - {name: geom,                   type: geometry,     nullable: false, description: 'Native Iceberg v3 GEOMETRY(EPSG:3857); Point for role=''point'', Polygon/MultiPolygon for role=''footprint''. Sedona reads it via ST_GeomFromWKB(spark_st_asbinary(geom)).'}
       - {name: ingested_at,            type: timestamp,    nullable: false, description: Row insertion timestamp.}

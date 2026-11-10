@@ -1,13 +1,13 @@
 # Ingest + smoke-test runtime for the NSI-minimal schema.
-# Apache Sedona on PySpark (local mode) reading/writing Iceberg tables.
-pyspark==3.5.*
-apache-sedona[spark]>=1.6.0
+# Apache Sedona on PySpark reading/writing Iceberg v3 tables.
+pyspark==4.1.*
+apache-sedona[spark]==1.9.1  # must match the Sedona JAR in tools/ingest_nsi.py
 pyarrow>=14.0
 pytest>=7.0
 pyyaml>=6.0
 
 # Notes
 # -----
-# Sedona pulls its Spark JARs via spark.jars.packages (declared in
-# tools/ingest_nsi.py and test/conftest.py), so no additional JAR is listed
-# here. Java 11 or 17 must be on PATH for PySpark 3.5.
+# Sedona and Iceberg Spark JARs are pulled via spark.jars.packages (pinned in
+# tools/ingest_nsi.py), so no JAR is listed here. Native Iceberg v3 GEOMETRY
+# columns need Spark 4.1 + Iceberg >= 1.12. Java 17+ must be on PATH for PySpark 4.x.

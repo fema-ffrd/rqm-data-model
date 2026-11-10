@@ -20,8 +20,8 @@ A prior exploration on `feature/hybrid_data_model` built the full RQM wish list 
 
 | Tier | Technology | Role |
 |---|---|---|
-| **Lakehouse** | Apache Iceberg | Versioned storage for `buildings` and `geometries` |
-| **Query engine** | Apache Sedona on PySpark 3.5+ | SQL, `ST_*` geometry functions, batch ingest |
+| **Lakehouse** | Apache Iceberg (format-version 3) | Versioned storage for `buildings` and `geometries`; native `GEOMETRY` columns |
+| **Query engine** | Apache Sedona 1.9 on PySpark 4.1 | SQL, `ST_*` geometry functions, batch ingest |
 
 Primary and foreign keys are logical (Iceberg does not enforce them). The ingest script and the smoke tests enforce the invariants listed in the ADR.
 
@@ -36,8 +36,8 @@ Two tables. One FK edge. See [data-dictionary/data-dictionary.md](data-dictionar
 
 ### How the pieces fit together
 
-- **`buildings`** is the flat inventory projection. NSI field names (`occtype`, `num_story`, `val_struct`, `pop2amu65`, `firmzone`, `cbfips`, …) are preserved verbatim so queries line up with the raw parquet. A surrogate `building_id` is the primary key; `fd_id` is the external natural key.
-- **`geometries`** carries one row per `(building, representation, alternate)` tuple. The NSI load creates exactly one row per structure with `role='point'`, `purpose='computation'`, `is_selected_for_export=true`, `crs='EPSG:3857'`, and `geom` holding the WKB point from the NSI `shape` column. Later, a footprint load (MSBF or USAS) writes additional rows with `role='footprint'`; a selection migration flips `is_selected_for_export` as needed.
+- **`buildings`** is the flat inventory projection. NSI field names (`occtype`, `num_story`, `val_struct`, `pop2amu65`, `firmzone`, `cbfips`, …) are preserved verbatim so queries line up with the raw parquet. `building_id` is the primary key and equals the NSI `fd_id`, so ids are stable across re-ingests. The table is partitioned by state (`truncate(2, cbfips)`) and sorted by `cbfips`.
+- **`geometries`** carries one row per `(building, representation, alternate)` tuple. The NSI load creates exactly one row per structure with `role='point'`, `purpose='computation'`, `is_selected_for_export=true`, `crs='EPSG:3857'`, and `geom` holding the NSI `shape` point as a native Iceberg v3 `GEOMETRY(3857)`. `geometry_id` is the xxhash64 of the row's natural key `(source_ref, building_id, role, purpose, alt_group_key)`, so it is stable across re-ingests. Sedona queries read it via `ST_GeomFromWKB(spark_st_asbinary(geom))` (see `sedona_geom_sql()` in `tools/ingest_nsi.py`). Later, a footprint load (MSBF or USAS) writes additional rows with `role='footprint'`; a selection migration flips `is_selected_for_export` as needed.
 - **Enums** for `occtype`, `st_damcat`, `found_type`, `geometry_role`, and `geometry_purpose` are inlined in the YAML rather than normalized into lookup tables. NSI already publishes stable short codes; a lookup table adds nothing until per-code metadata (RSMeans rates, fragility curves) is actually needed, and adding one later is additive.
 
 ### Deferred concepts (re-entry map)
@@ -82,6 +82,7 @@ rqm-data-model/
 ├── test/
 │   ├── conftest.py                # session-scoped Spark + ingest fixture
 │   ├── test_nsi_ingest.py         # smoke tests (ADR validation rules)
+│   ├── test_spark_settings.py     # unit tests for session/catalog/layout config
 │   └── data/
 │       ├── nsi.parquet            # sample NSI extract (46 cols, ~45k rows)
 │       └── README.md              # provenance of the sample
@@ -105,7 +106,7 @@ OK: validated 2 tables, 57 columns. Wrote data-dictionary.md.
 
 ## Running the ingest and smoke tests
 
-Requires Java 11 or 17 on PATH for PySpark 3.5.
+Requires Java 17+ on PATH for PySpark 4.1.
 
 ```powershell
 pip install -r tools/requirements.txt
@@ -120,7 +121,23 @@ OK: ingested 45622 buildings, 45622 geometries from 45622 parquet rows
 into Iceberg warehouse at test/warehouse.
 ```
 
-The test suite asserts the six validation rules from the ADR: field coverage, row-count parity, non-null `occtype`, geometry validity + `EPSG:3857`, selected-geometry uniqueness, and every-building-has-a-point. A non-asserting diagnostic prints NSI release completeness for `found_type`, `val_struct`, and `bldheight`.
+The test suite asserts the seven validation rules from the ADR: field coverage, row-count parity, non-null `occtype`, geometry validity + `EPSG:3857`, selected-geometry uniqueness, every-building-has-a-point, and stable unique `building_id` (= `fd_id`). It also checks the tables are Iceberg v3 with a native geometry column and the default partition/sort layout. A non-asserting diagnostic prints NSI release completeness for `found_type`, `val_struct`, and `bldheight`.
+
+### Configuring the Spark session
+
+`tools/ingest_nsi.py` builds its session from `SparkSettings`; defaults run Spark locally (`local[*]`) against a Hadoop (file-system) Iceberg catalog in `--warehouse`. The same knobs are exposed on the CLI so moving to a cluster or a managed catalog is configuration, not code:
+
+```bash
+# Local tuning
+python tools/ingest_nsi.py --parquet test/data/nsi.parquet --warehouse test/warehouse \
+    --master "local[4]" --conf spark.driver.memory=8g
+
+# Table layout overrides (applied when a table is created)
+python tools/ingest_nsi.py --parquet test/data/nsi.parquet --warehouse test/warehouse \
+    --partition "geometries=bucket(16, building_id)" --write-order "geometries=building_id"
+```
+
+For cluster runs, `--master ""` defers to `spark-submit` / the cluster manager, `--catalog-type` + `--catalog-prop KEY=VALUE` select another Iceberg catalog (e.g. `rest` with `uri=...`, or `glue`), `--warehouse` accepts an object-store URI, and `--conf` passes any other Spark setting. The `--parquet` source is still read from the local file system.
 
 ## License
 

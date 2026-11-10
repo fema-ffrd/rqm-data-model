@@ -6,6 +6,7 @@ and the ingest runs once against a scratch warehouse under
 `test/warehouse-pytest/`. Individual tests get a ready-to-query
 `(spark, catalog)` tuple.
 """
+
 from __future__ import annotations
 
 import shutil
@@ -39,6 +40,7 @@ def ingested_spark(nsi_parquet: Path):
     pytest.importorskip("sedona")
 
     from ingest_nsi import (  # type: ignore[import-not-found]
+        SparkSettings,
         apply_schema,
         build_spark,
         load_buildings,
@@ -49,7 +51,7 @@ def ingested_spark(nsi_parquet: Path):
         shutil.rmtree(WAREHOUSE)
     WAREHOUSE.mkdir(parents=True, exist_ok=True)
 
-    spark = build_spark(WAREHOUSE, catalog=CATALOG)
+    spark = build_spark(SparkSettings(warehouse=WAREHOUSE, catalog=CATALOG))
     try:
         apply_schema(spark, CATALOG)
         load_buildings(spark, nsi_parquet, CATALOG)

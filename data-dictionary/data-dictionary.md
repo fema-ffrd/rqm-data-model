@@ -1,6 +1,6 @@
 # Risk Quantification Methodology (RQM) Data Model — NSI Minimal — Data Dictionary
 
-**Version:** 0.2.0 &nbsp;|&nbsp; **Companion:** `fema-ffrd/inland-consequences` &nbsp;|&nbsp; **Query engine:** Apache Sedona (Spark 3.x)
+**Version:** 0.2.0 &nbsp;|&nbsp; **Companion:** `fema-ffrd/inland-consequences` &nbsp;|&nbsp; **Query engine:** Apache Sedona (Spark 4.1)
 
 NSI-minimal edition: a focused, loadable schema for a single National Structure Inventory parquet ingest, with first-class multiple-geometry support (ADR-geometry) preserved so additional footprint sources can be attached beside each NSI point without a schema break. Component decomposition, attribute uncertainty, hazard links, DDFs, loss realizations, export contracts, provenance registry, and bitemporal versioning are deferred; re-entry points are documented in ADR-nsi-minimal. The previous full-coverage dictionary is preserved at `data-dictionary-full.yaml`.
 
@@ -23,13 +23,13 @@ NSI-minimal edition: a focused, loadable schema for a single National Structure 
 ### `buildings`
 **Storage:** Iceberg (via Apache Sedona) &nbsp;|&nbsp; **Grain:** One row per NSI structure.
 
-Flat NSI inventory projection. Every NSI parquet column maps 1:1 to a column on this table, using NSI's native field names (occtype, num_story, val_struct, pop2amu65, …) so queries line up with the raw source. Geometry lives in the `geometries` table (ADR-geometry preserved). Component decomposition, attribute uncertainty specs, hazard links, DDFs, loss realizations, export contracts, provenance registry, and bitemporal versioning are all deferred; re-entry points are documented in ADR-nsi-minimal. The primary key `building_id` is a surrogate generated at ingest; `fd_id` is the external natural key.
+Flat NSI inventory projection. Every NSI parquet column maps 1:1 to a column on this table, using NSI's native field names (occtype, num_story, val_struct, pop2amu65, …) so queries line up with the raw source. Geometry lives in the `geometries` table (ADR-geometry preserved). Component decomposition, attribute uncertainty specs, hazard links, DDFs, loss realizations, export contracts, provenance registry, and bitemporal versioning are all deferred; re-entry points are documented in ADR-nsi-minimal. The primary key `building_id` is set to the NSI `fd_id` at ingest so ids are stable across re-ingests; `fd_id` is kept as the external natural key. Physical layout: partitioned by state (Iceberg `truncate(2, cbfips)`) and sorted by `cbfips`.
 
 | Column | Type | Key | Null | Description |
 |---|---|---|---|---|
-| `building_id` | bigint | PK | NOT NULL | Surrogate primary key (generated at ingest; logical identity). |
-| `fd_id` | bigint |  |  | NSI structure id (external natural key; logically UNIQUE where not null). |
-| `bid` | bigint |  |  | NSI block id. |
+| `building_id` | bigint | PK | NOT NULL | Stable primary key; equals the NSI fd_id (logical identity; unique, asserted in smoke tests). |
+| `fd_id` | bigint |  |  | NSI structure id (external natural key; source of building_id; logically UNIQUE where not null). |
+| `bid` | varchar(32) |  |  | NSI building id (UBID — Open Location Code plus extents, e.g. 8645XMJC+QG9-2-2-3-1). |
 | `usastrucid` | varchar(32) |  |  | FEMA USA Structures id (joins to USAS footprint source). |
 | `ftprntid` | varchar(64) |  |  | Footprint id as reported by NSI (joins to geometries.source_ref when the footprint source is attached). |
 | `ftprntsrc` | varchar(32) |  |  | Footprint source tag (MSBF |
@@ -69,7 +69,7 @@ Flat NSI inventory projection. Every NSI parquet column maps 1:1 to a column on 
 | `fullrep` | real |  |  | NSI fullrep indicator (full-replacement flag or share). |
 | `depindex` | real |  |  | NSI dependency index. |
 | `creprcnt` | real |  |  | NSI community-resilience percent indicator. |
-| `crerank` | integer |  |  | NSI community-resilience rank. |
+| `crerank` | real |  |  | NSI community-resilience rank (fractional, 0-1). |
 | `cbfips` | varchar(15) |  |  | Census block GEOID (15-digit FIPS) for community-level aggregation. |
 | `x` | double |  |  | NSI structure X coordinate (EPSG:3857). Denormalized from `shape` for query convenience. |
 | `y` | double |  |  | NSI structure Y coordinate (EPSG:3857). Denormalized from `shape` for query convenience. |
@@ -78,17 +78,17 @@ Flat NSI inventory projection. Every NSI parquet column maps 1:1 to a column on 
 ### `geometries`
 **Storage:** Iceberg (via Apache Sedona) &nbsp;|&nbsp; **Grain:** One row per (building, representation, alternate) geometric record.
 
-First-class geometry registry (ADR-geometry preserved). Each row holds one geometric representation of a building. The NSI load produces exactly one row per structure with role='point', purpose='computation', is_selected_for_export=true, geom from the parquet `shape` column (EPSG:3857). Alternate footprints (MSBF, USAS) land as additional rows with role='footprint' and may flip the selected flag via a separate selection migration. Logical invariant: exactly one row per (building_id, purpose='computation') has is_selected_for_export=true at any time — enforced by the ingest script and smoke tests (Iceberg does not enforce UNIQUE). 3D roles, component-level geometry, and bitemporal validity are deferred (see ADR-nsi-minimal re-entry map).
+First-class geometry registry (ADR-geometry preserved). Each row holds one geometric representation of a building. The NSI load produces exactly one row per structure with role='point', purpose='computation', is_selected_for_export=true, geom from the parquet `shape` column stored as a native Iceberg v3 GEOMETRY with a column-level CRS of EPSG:3857. Alternate footprints (MSBF, USAS) land as additional rows with role='footprint' and may flip the selected flag via a separate selection migration. Logical invariant: exactly one row per (building_id, purpose='computation') has is_selected_for_export=true at any time — enforced by the ingest script and smoke tests (Iceberg does not enforce UNIQUE). 3D roles, component-level geometry, and bitemporal validity are deferred (see ADR-nsi-minimal re-entry map). Physical layout: unpartitioned by default (configurable via TableLayout in tools/ingest_nsi.py).
 
 | Column | Type | Key | Null | Description |
 |---|---|---|---|---|
-| `geometry_id` | bigint | PK | NOT NULL | Surrogate primary key. |
+| `geometry_id` | bigint | PK | NOT NULL | Stable primary key: xxhash64 of the natural key (source_ref, building_id, role, purpose, alt_group_key), so a geometry keeps its id across re-ingests and selection changes. The ingest refuses a write whose id collides with a different natural key. |
 | `building_id` | bigint | FK → `buildings.building_id` | NOT NULL | Parent structure (logical FK; cascade behavior enforced by the ingest contract). |
 | `role` | varchar(16) |  | NOT NULL | Geometry role (enum geometry_role): point | footprint. 3D roles deferred. |
 | `purpose` | varchar(16) |  | NOT NULL | Why this representation exists (enum geometry_purpose): computation | hazard_sampling | display | qc. |
 | `is_selected_for_export` | boolean |  | NOT NULL | Exactly one TRUE per (building_id |
 | `alt_group_key` | varchar(64) |  |  | Groups competing alternates at the same (building_id |
 | `source_ref` | varchar(64) |  |  | Source dataset identifier (e.g., NSI-2024.1, MSBF-2022-10, USAS-2024). |
-| `crs` | varchar(16) |  | NOT NULL | EPSG string for this row's geometry (e.g. |
-| `geom` | geometry |  | NOT NULL | Sedona geometry value; Point for role='point' |
+| `crs` | varchar(16) |  | NOT NULL | EPSG string for this row's geometry; must equal the geom column CRS (EPSG:3857), so alternates are reprojected on load. |
+| `geom` | geometry |  | NOT NULL | Native Iceberg v3 GEOMETRY(EPSG:3857); Point for role='point', Polygon/MultiPolygon for role='footprint'. Sedona reads it via ST_GeomFromWKB(spark_st_asbinary(geom)). |
 | `ingested_at` | timestamp |  | NOT NULL | Row insertion timestamp. |

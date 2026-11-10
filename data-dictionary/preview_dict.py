@@ -5,9 +5,11 @@ The YAML is the single source of truth; the Markdown is generated. Also validate
 foreign key points to an existing table.column and that every table of a tier that requires
 a primary key has one.
 """
+
 import sys
-import yaml
 from pathlib import Path
+
+import yaml
 
 HERE = Path(__file__).parent
 SRC = HERE / "data-dictionary.yaml"
@@ -49,7 +51,9 @@ def validate(model):
                 if ft not in tables:
                     errors.append(f"[{tname}.{c['name']}] fk -> unknown table '{ft}'")
                 elif fc not in colindex[ft]:
-                    errors.append(f"[{tname}.{c['name']}] fk -> unknown column '{ft}.{fc}'")
+                    errors.append(
+                        f"[{tname}.{c['name']}] fk -> unknown column '{ft}.{fc}'"
+                    )
     return errors
 
 

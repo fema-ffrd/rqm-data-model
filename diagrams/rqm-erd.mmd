@@ -1,6 +1,6 @@
 %% =====================================================================
 %% Risk Quantification Methodology (RQM) Data Model — NSI-Minimal ERD
-%% Two Iceberg tables, one FK edge. Apache Sedona is the query engine.
+%% Two Iceberg v3 tables, one FK edge. Apache Sedona is the query engine.
 %%
 %% buildings  : one row per NSI structure; every NSI parquet column maps 1:1.
 %% geometries : first-class multi-geometry attach (ADR-geometry preserved).
@@ -16,9 +16,9 @@
 erDiagram
 
   buildings {
-    bigint      building_id PK
+    bigint      building_id PK "= fd_id"
     bigint      fd_id
-    bigint      bid
+    varchar     bid
     varchar     usastrucid
     varchar     ftprntid
     varchar     ftprntsrc
@@ -58,7 +58,7 @@ erDiagram
     real        fullrep
     real        depindex
     real        creprcnt
-    integer     crerank
+    real        crerank
     varchar     cbfips
     double      x
     double      y

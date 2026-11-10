@@ -26,13 +26,14 @@ The actionable goal: **ingest the real NSI parquet (`test/data/nsi.parquet`, 46 
 
 ### Tables
 
-- **`buildings`** — one row per NSI structure. Columns map every NSI parquet field one-to-one, using NSI's native field names (`occtype`, `num_story`, `val_struct`, `pop2amu65`, `firmzone`, …) so analyst queries line up with the raw source. Surrogate `building_id` is the primary key; `fd_id` is the external natural key.
-- **`geometries`** — first-class geometry registry. The NSI load produces exactly one row per structure with `role='point'`, `purpose='computation'`, `is_selected_for_export=true`, `geom` from the parquet `shape` column (EPSG:3857). Alternates (MSBF, USAS footprints) land as additional rows and may flip the selected flag via a separate selection migration.
+- **`buildings`** — one row per NSI structure. Columns map every NSI parquet field one-to-one, using NSI's native field names (`occtype`, `num_story`, `val_struct`, `pop2amu65`, `firmzone`, …) so analyst queries line up with the raw source. `building_id` is the primary key and is set to the NSI `fd_id` at ingest, so ids are stable across re-ingests; `fd_id` is kept as the external natural key.
+- **`geometries`** — first-class geometry registry. The NSI load produces exactly one row per structure with `role='point'`, `purpose='computation'`, `is_selected_for_export=true`, `geom` from the parquet `shape` column stored as a native Iceberg v3 `GEOMETRY(3857)`. Alternates (MSBF, USAS footprints) land as additional rows and may flip the selected flag via a separate selection migration.
 
 ### Engine and storage
 
-- **Storage tier:** Apache Iceberg tables.
-- **Query engine:** Apache Sedona (PySpark 3.5+) in local mode for development and tests. Sedona provides the geometry UDT and the `ST_*` function family.
+- **Storage tier:** Apache Iceberg format-version 3 tables. `geometries.geom` uses the native v3 `GEOMETRY` type with a column-level CRS of EPSG:3857.
+- **Query engine:** Apache Sedona 1.9 on PySpark 4.1 (local mode for development and tests; the same `SparkSettings` target a cluster and a REST/Glue catalog). Spark 4.1 + Iceberg 1.12 is the first open-source stack that reads and writes v3 geometry columns. Sedona provides the `ST_*` function family; because Sedona shadows Spark's built-in geometry functions and only accepts its own geometry UDT, the ingest registers Spark's built-ins as `spark_st_*` and Sedona reads `geom` via `ST_GeomFromWKB(spark_st_asbinary(geom))`.
+- **Physical layout:** `buildings` is partitioned by state (`truncate(2, cbfips)`) and sorted by `cbfips`; `geometries` is unpartitioned. Layouts are configurable per table at creation (`TableLayout` in `tools/ingest_nsi.py`).
 - **Primary/foreign keys** are logical; Iceberg does not enforce them. Invariants are enforced by the ingest script and the smoke-test suite.
 
 ### Lookups
@@ -41,7 +42,7 @@ Occupancy, damage category, foundation type, and FIRM zone are inlined as `varch
 
 ### Identity and versioning
 
-`building_id` is the only identity. `ingested_at` is the entire version history. The hybrid branch's `asset` / `asset_revision` / `inventory_branch` / `revision_log` / `versioning` split is deferred.
+`building_id` is the structure identity; it equals the NSI `fd_id`, so a structure keeps its id across re-ingests. `geometry_id` is likewise deterministic: the xxhash64 of the row's natural key `(source_ref, building_id, role, purpose, alt_group_key)`, so a geometry keeps its id across re-ingests and selection migrations, and the ingest refuses a write whose id collides with a different natural key. `ingested_at` is the entire version history. The hybrid branch's `asset` / `asset_revision` / `inventory_branch` / `revision_log` / `versioning` split is deferred.
 
 ## Validation rules
 
@@ -53,6 +54,7 @@ Logical invariants enforced by the ingest script (`tools/ingest_nsi.py`) and ass
 4. `crs` is a well-formed EPSG string (the NSI load sets `EPSG:3857`).
 5. `buildings.occtype` is non-null for every row (NSI always publishes it).
 6. The ingest's row count equals the NSI parquet's row count; the `geometries` row count equals the same number when only the NSI point source is loaded.
+7. `buildings.building_id` equals `fd_id` and is unique.
 
 ## Alternatives considered
 

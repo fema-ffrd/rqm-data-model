@@ -1,24 +1,31 @@
 -- =============================================================================
--- RQM NSI-Minimal Schema — Apache Iceberg DDL (Spark SQL dialect)
+-- RQM NSI-Minimal Schema — Apache Iceberg v3 DDL (Spark SQL dialect)
 -- -----------------------------------------------------------------------------
--- Executed against a Sedona-registered Spark session with an Iceberg catalog
+-- Executed against a Sedona-registered Spark 4.1 session with an Iceberg catalog
 -- named `rqm` (configured in tools/ingest_nsi.py / test/conftest.py).
+--
+-- Tables use Iceberg format-version 3 so `geometries.geom` is a native
+-- GEOMETRY column. Partition specs and write orders are not declared here:
+-- `apply_schema` appends them at creation from `TableLayout`
+-- (DEFAULT_LAYOUTS in tools/ingest_nsi.py).
 --
 -- Iceberg does not enforce PRIMARY KEY / FOREIGN KEY / NOT NULL in the same
 -- way a relational engine does; those are declared here for documentation and
 -- enforced by the ingest script + smoke tests. Column names, types, and order
 -- mirror data-dictionary/data-dictionary.yaml.
 -- =============================================================================
-
-CREATE NAMESPACE IF NOT EXISTS rqm;
+-- The `rqm.` prefix is the Iceberg catalog itself; tables live at the catalog
+-- root, so no CREATE NAMESPACE is needed (and one would run against Spark's
+-- session catalog, not the Iceberg catalog).
+-- =============================================================================
 
 -- -----------------------------------------------------------------------------
 -- buildings: one row per NSI structure, every parquet field mapped 1:1.
 -- -----------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS rqm.buildings (
-    building_id   BIGINT    NOT NULL COMMENT 'Surrogate PK (generated at ingest).',
-    fd_id         BIGINT             COMMENT 'NSI structure id (external natural key).',
-    bid           BIGINT             COMMENT 'NSI block id.',
+    building_id   BIGINT    NOT NULL COMMENT 'Stable PK; set to the NSI fd_id at ingest.',
+    fd_id         BIGINT             COMMENT 'NSI structure id (external natural key; source of building_id).',
+    bid           STRING             COMMENT 'NSI building id (UBID, e.g. 8645XMJC+QG9-2-2-3-1).',
     usastrucid    STRING             COMMENT 'FEMA USA Structures id.',
     ftprntid      STRING             COMMENT 'Footprint id as reported by NSI.',
     ftprntsrc     STRING             COMMENT 'Footprint source tag.',
@@ -58,26 +65,28 @@ CREATE TABLE IF NOT EXISTS rqm.buildings (
     fullrep       FLOAT              COMMENT 'NSI fullrep indicator.',
     depindex      FLOAT              COMMENT 'NSI dependency index.',
     creprcnt      FLOAT              COMMENT 'NSI community-resilience percent.',
-    crerank       INT                COMMENT 'NSI community-resilience rank.',
+    crerank       FLOAT              COMMENT 'NSI community-resilience rank (fractional, 0-1).',
     cbfips        STRING             COMMENT 'Census block GEOID (15-digit FIPS).',
     x             DOUBLE             COMMENT 'NSI X coordinate (EPSG:3857); denormalized from shape.',
     y             DOUBLE             COMMENT 'NSI Y coordinate (EPSG:3857); denormalized from shape.',
     ingested_at   TIMESTAMP NOT NULL COMMENT 'Row insertion timestamp.'
-) USING iceberg;
+) USING iceberg
+TBLPROPERTIES ('format-version' = '3');
 
 -- -----------------------------------------------------------------------------
 -- geometries: first-class geometry. One row per (building, representation,
 -- alternate). NSI load creates one row per structure with role='point'.
 -- -----------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS rqm.geometries (
-    geometry_id            BIGINT    NOT NULL COMMENT 'Surrogate PK.',
+    geometry_id            BIGINT    NOT NULL COMMENT 'Stable PK: xxhash64 of (source_ref, building_id, role, purpose, alt_group_key); same id on every re-ingest.',
     building_id            BIGINT    NOT NULL COMMENT 'FK -> rqm.buildings.building_id (logical).',
     role                   STRING    NOT NULL COMMENT 'point | footprint.',
     purpose                STRING    NOT NULL COMMENT 'computation | hazard_sampling | display | qc.',
     is_selected_for_export BOOLEAN   NOT NULL COMMENT 'Exactly one TRUE per (building_id, purpose=computation).',
     alt_group_key          STRING             COMMENT 'Groups alternates at the same (building_id, role).',
     source_ref             STRING             COMMENT 'Source dataset identifier.',
-    crs                    STRING    NOT NULL COMMENT 'EPSG string for this row''s geometry.',
-    geom                   BINARY    NOT NULL COMMENT 'Well-Known Binary (WKB). Read via ST_GeomFromWKB(geom); writes serialize with ST_AsBinary(geometry).',
+    crs                    STRING    NOT NULL COMMENT 'EPSG string for the geometry in this row; must equal the geom column CRS (EPSG:3857).',
+    geom                   GEOMETRY(3857) NOT NULL COMMENT 'Native Iceberg v3 geometry, EPSG:3857. Sedona reads via ST_GeomFromWKB(spark_st_asbinary(geom)); writes via spark_st_setsrid(spark_st_geomfromwkb(wkb), 3857).',
     ingested_at            TIMESTAMP NOT NULL COMMENT 'Row insertion timestamp.'
-) USING iceberg;
+) USING iceberg
+TBLPROPERTIES ('format-version' = '3');

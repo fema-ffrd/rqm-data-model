@@ -1,9 +1,10 @@
 """Smoke tests for the NSI-minimal ingest.
 
-Asserts the six validation rules from ADR-nsi-minimal and the five smoke
+Asserts the seven validation rules from ADR-nsi-minimal and the five smoke
 queries from the implementation plan. The session-scoped `ingested_spark`
 fixture in conftest.py handles the slow Spark boot + initial load.
 """
+
 from __future__ import annotations
 
 from pathlib import Path
@@ -11,19 +12,54 @@ from pathlib import Path
 import pyarrow.parquet as pq
 import pytest
 
-
 # NSI parquet column names (sans `shape`) that the schema promises to map.
 # Kept in sync with tools/ingest_nsi.py :: NSI_SCALAR_FIELDS.
 EXPECTED_NSI_COLUMNS = {
-    "fd_id", "bid", "usastrucid", "ftprntid", "ftprntsrc", "source",
-    "occtype", "st_damcat", "bldgtype", "num_story", "sqft", "ftprntsqft",
-    "bldheight", "med_yr_blt", "found_type", "found_ht",
-    "val_struct", "val_cont", "val_vehic", "ornl_low", "ornl_med", "ornl_hgh",
-    "resunits", "novehprob", "vehperunit",
-    "pop2amu65", "pop2amo65", "pop2pmu65", "pop2pmo65",
-    "u65disable", "o65disable", "students",
-    "firmzone", "zone_sub", "static_bfe", "ground_elv", "grnd_elv_m",
-    "pctlowclr", "fullrep", "depindex", "creprcnt", "crerank", "cbfips",
+    "fd_id",
+    "bid",
+    "usastrucid",
+    "ftprntid",
+    "ftprntsrc",
+    "source",
+    "occtype",
+    "st_damcat",
+    "bldgtype",
+    "num_story",
+    "sqft",
+    "ftprntsqft",
+    "bldheight",
+    "med_yr_blt",
+    "found_type",
+    "found_ht",
+    "val_struct",
+    "val_cont",
+    "val_vehic",
+    "ornl_low",
+    "ornl_med",
+    "ornl_hgh",
+    "resunits",
+    "novehprob",
+    "vehperunit",
+    "pop2amu65",
+    "pop2amo65",
+    "pop2pmu65",
+    "pop2pmo65",
+    "u65disable",
+    "o65disable",
+    "students",
+    "firmzone",
+    "zone_sub",
+    "static_bfe",
+    "ground_elv",
+    "grnd_elv_m",
+    "pctlowclr",
+    "fullrep",
+    "depindex",
+    "creprcnt",
+    "crerank",
+    "cbfips",
+    "x",
+    "y",
     "shape",
 }
 
@@ -65,20 +101,168 @@ def test_counts_by_occupancy_have_no_null_occtype(ingested_spark) -> None:
 def test_geometry_validity_and_srid(ingested_spark) -> None:
     """Smoke query 3: all geometries are valid and in EPSG:3857.
 
-    `geom` is WKB (BINARY) in storage; wrap with ST_GeomFromWKB to validate.
-    SRID is set by ST_SetSRID because WKB loses the EPSG metadata at write time;
-    we check against the `crs` column instead.
+    `geom` is a native GEOMETRY(3857) column; Sedona validates it after the
+    `spark_st_asbinary` bridge. Both the column SRID and the `crs` column
+    must agree on EPSG:3857.
     """
+    from ingest_nsi import sedona_geom_sql  # type: ignore[import-not-found]
+
     spark, cat = ingested_spark
     invalid = spark.sql(
         f"""
         SELECT COUNT(*) AS n_invalid
         FROM {cat}.geometries
-        WHERE NOT ST_IsValid(ST_GeomFromWKB(geom))
+        WHERE NOT ST_IsValid({sedona_geom_sql()})
+           OR spark_st_srid(geom) != 3857
            OR crs != 'EPSG:3857'
         """
     ).collect()[0]["n_invalid"]
     assert invalid == 0, f"{invalid} geometries failed validity / CRS check"
+
+
+def test_tables_are_iceberg_v3_with_native_geometry(ingested_spark) -> None:
+    """Both tables are Iceberg format-version 3 and `geom` is a native
+    GEOMETRY(3857) column (not WKB BINARY).
+    """
+    spark, cat = ingested_spark
+    for table in ("buildings", "geometries"):
+        props = {
+            r.key: r.value
+            for r in spark.sql(f"SHOW TBLPROPERTIES {cat}.{table}").collect()
+        }
+        assert props.get("format-version") == "3", f"{table}: {props}"
+    geom_type = spark.table(f"{cat}.geometries").schema["geom"].dataType.simpleString()
+    assert geom_type == "geometry(3857)", geom_type
+
+
+def test_building_id_is_stable_fd_id(ingested_spark) -> None:
+    """ADR-nsi-minimal rule 7: `building_id` equals the NSI `fd_id` and is
+    unique, so ids survive re-ingest and partition-count changes.
+    """
+    spark, cat = ingested_spark
+    row = spark.sql(
+        f"""
+        SELECT COUNT(*)                                           AS n,
+               COUNT(DISTINCT building_id)                        AS n_distinct,
+               SUM(CASE WHEN building_id <=> fd_id THEN 0 ELSE 1 END) AS n_mismatch
+        FROM {cat}.buildings
+        """
+    ).collect()[0]
+    assert row["n_mismatch"] == 0, (
+        f"{row['n_mismatch']} rows where building_id != fd_id"
+    )
+    assert row["n_distinct"] == row["n"], "building_id is not unique"
+
+
+def test_geometry_id_is_stable_natural_key_hash(ingested_spark) -> None:
+    """`geometry_id` is the xxhash64 of the natural key, unique, and pinned to
+    a known value so a change to the hashing scheme (which would re-key every
+    geometry) fails loudly.
+    """
+    from ingest_nsi import geometry_id_expr  # type: ignore[import-not-found]
+    from pyspark.sql import functions as F
+
+    spark, cat = ingested_spark
+    geoms = spark.table(f"{cat}.geometries")
+    row = geoms.select(
+        F.count("*").alias("n"),
+        F.countDistinct("geometry_id").alias("n_distinct"),
+        F.sum((F.col("geometry_id") != geometry_id_expr()).cast("int")).alias(
+            "n_mismatch"
+        ),
+    ).collect()[0]
+    assert row["n_mismatch"] == 0, (
+        f"{row['n_mismatch']} rows where geometry_id != hash of natural key"
+    )
+    assert row["n_distinct"] == row["n"], "geometry_id is not unique"
+
+    pinned = (
+        geoms.where("building_id = 120262564")
+        .select("source_ref", "geometry_id")
+        .collect()
+    )
+    assert [(r.source_ref, r.geometry_id) for r in pinned] == [
+        ("NSI-P", -7205520827729515936)
+    ]
+
+
+def test_geometry_id_collision_guard(ingested_spark) -> None:
+    """The ingest refuses rows whose geometry_id matches a different natural
+    key, but re-ingesting an identical key is not a collision.
+    """
+    from ingest_nsi import assert_no_geometry_id_collisions  # type: ignore[import-not-found]
+
+    spark, _ = ingested_spark
+
+    def rows(building_id: int):
+        # SQL VALUES keeps this in the JVM (no Python worker processes).
+        return spark.sql(
+            "SELECT CAST(1 AS BIGINT) AS geometry_id, 'NSI-P' AS source_ref, "
+            f"CAST({building_id} AS BIGINT) AS building_id, 'point' AS role, "
+            "'computation' AS purpose, CAST(NULL AS STRING) AS alt_group_key"
+        )
+
+    existing = rows(10)
+    assert_no_geometry_id_collisions(rows(10), existing)
+    with pytest.raises(ValueError, match="collision"):
+        assert_no_geometry_id_collisions(rows(11), existing)
+
+
+def test_crerank_keeps_fractional_values(nsi_parquet: Path, ingested_spark) -> None:
+    """`crerank` is fractional in NSI (0-1); it is stored as FLOAT, so values
+    match the parquet instead of truncating to 0.
+    """
+    from pyspark.sql import functions as F
+
+    spark, cat = ingested_spark
+    raw = spark.read.parquet(str(nsi_parquet)).select(
+        F.col("fd_id").alias("building_id"), F.col("crerank").alias("raw_crerank")
+    )
+    row = (
+        spark.table(f"{cat}.buildings")
+        .join(raw, "building_id")
+        .select(
+            F.max(F.abs(F.col("crerank") - F.col("raw_crerank"))).alias("max_abs_diff"),
+            F.sum(
+                (F.col("crerank").isNull() != F.col("raw_crerank").isNull()).cast("int")
+            ).alias("null_mismatch"),
+            F.sum((F.col("crerank") != F.floor("crerank")).cast("int")).alias(
+                "n_fractional"
+            ),
+        )
+        .collect()[0]
+    )
+    assert (
+        spark.table(f"{cat}.buildings").schema["crerank"].dataType.simpleString()
+        == "float"
+    )
+    assert row["null_mismatch"] == 0
+    assert row["max_abs_diff"] is not None and row["max_abs_diff"] < 1e-6, row
+    assert row["n_fractional"] > 0, (
+        "expected fractional crerank values in the NSI sample"
+    )
+
+
+def test_default_table_layouts(ingested_spark) -> None:
+    """`buildings` is partitioned by state (truncate(2, cbfips)) and sorted by
+    cbfips; `geometries` keeps the default unpartitioned, unsorted layout.
+    """
+    spark, cat = ingested_spark
+
+    def partitioning(table: str) -> list[str]:
+        rows = spark.sql(f"DESCRIBE TABLE {cat}.{table}").collect()
+        return [r.data_type for r in rows if r.col_name.startswith("Part ")]
+
+    def tblprops(table: str) -> dict[str, str]:
+        return {
+            r.key: r.value
+            for r in spark.sql(f"SHOW TBLPROPERTIES {cat}.{table}").collect()
+        }
+
+    assert partitioning("buildings") == ["truncate(2, cbfips)"]
+    assert tblprops("buildings").get("sort-order") == "cbfips ASC NULLS FIRST"
+    assert partitioning("geometries") == []
+    assert "sort-order" not in tblprops("geometries")
 
 
 def test_value_totals_by_census_block(ingested_spark) -> None:
@@ -116,7 +300,9 @@ def test_selected_geometry_invariant(ingested_spark) -> None:
         HAVING COUNT(*) != 1
         """
     ).count()
-    assert violators == 0, f"{violators} buildings violate the selected-geometry invariant"
+    assert violators == 0, (
+        f"{violators} buildings violate the selected-geometry invariant"
+    )
 
 
 def test_every_building_has_a_computation_point(ingested_spark) -> None:
