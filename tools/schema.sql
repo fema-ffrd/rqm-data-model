@@ -28,12 +28,22 @@
 
 CREATE NAMESPACE IF NOT EXISTS rqm.inventory;
 
+-- Columns added to an existing table after its creation are migrated by
+-- `apply_schema` (ALTER TABLE ADD COLUMN, in DDL position, nullable): Iceberg
+-- cannot add a required column, and Spark 4.1 does not support column
+-- defaults, so readers coalesce NULLs in migrated columns
+-- (`ingest_nsi.conform_buildings`).
+
 -- -----------------------------------------------------------------------------
--- buildings: one row per NSI structure, every parquet field mapped 1:1.
+-- buildings: one row per structure per source inventory (ADR-multi-source).
+-- The NSI field set is the shared column schema; every source maps onto it
+-- through a YAML spec (tools/sources.py), and unmapped fields are NULL.
 -- -----------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS rqm.inventory.buildings (
-    building_id   BIGINT    NOT NULL COMMENT 'Stable PK; set to the NSI fd_id at ingest.',
-    fd_id         BIGINT             COMMENT 'NSI structure id (external natural key; source of building_id).',
+    building_id   BIGINT    NOT NULL COMMENT 'Stable PK. NSI rows: the fd_id. Other sources: xxhash64(source_ref, source_record_id) with the sign bit set (always negative).',
+    source_ref    STRING    NOT NULL COMMENT 'FK -> sources.source_ref: the inventory this row came from (NSI for the National Structure Inventory).',
+    source_record_id STRING          COMMENT 'Native id of the structure in its source (NSI: fd_id as a string).',
+    fd_id         BIGINT             COMMENT 'NSI structure id (external natural key; source of building_id for NSI rows).',
     bid           STRING             COMMENT 'NSI building id (UBID, e.g. 8645XMJC+QG9-2-2-3-1).',
     usastrucid    STRING             COMMENT 'FEMA USA Structures id.',
     ftprntid      STRING             COMMENT 'Footprint id as reported by NSI.',
@@ -76,8 +86,8 @@ CREATE TABLE IF NOT EXISTS rqm.inventory.buildings (
     creprcnt      FLOAT              COMMENT 'NSI community-resilience percent.',
     crerank       FLOAT              COMMENT 'NSI community-resilience rank (fractional, 0-1).',
     cbfips        STRING             COMMENT 'Census block GEOID (15-digit FIPS).',
-    x             DOUBLE             COMMENT 'NSI X coordinate (EPSG:3857); denormalized from shape.',
-    y             DOUBLE             COMMENT 'NSI Y coordinate (EPSG:3857); denormalized from shape.',
+    x             DOUBLE             COMMENT 'Longitude (WGS84) of the structure point, as NSI publishes it; denormalized from the computation geometry.',
+    y             DOUBLE             COMMENT 'Latitude (WGS84) of the structure point, as NSI publishes it; denormalized from the computation geometry.',
     ingested_at   TIMESTAMP NOT NULL COMMENT 'When this row was last written (insert, or update by a load that changed it).'
 ) USING iceberg
 TBLPROPERTIES (
@@ -89,7 +99,8 @@ TBLPROPERTIES (
 
 -- -----------------------------------------------------------------------------
 -- geometries: first-class geometry. One row per (building, representation,
--- alternate). NSI load creates one row per structure with role='point'.
+-- alternate). Every load creates one row per structure with role='point',
+-- purpose='computation'; polygon sources add a role='footprint' row.
 -- -----------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS rqm.inventory.geometries (
     geometry_id            BIGINT    NOT NULL COMMENT 'Stable PK: xxhash64 of (source_ref, building_id, role, purpose, alt_group_key); same id on every re-ingest.',
@@ -98,7 +109,7 @@ CREATE TABLE IF NOT EXISTS rqm.inventory.geometries (
     purpose                STRING    NOT NULL COMMENT 'computation | hazard_sampling | display | qc.',
     is_selected_for_export BOOLEAN   NOT NULL COMMENT 'Exactly one TRUE per (building_id, purpose=computation).',
     alt_group_key          STRING             COMMENT 'Groups alternates at the same (building_id, role).',
-    source_ref             STRING             COMMENT 'Source dataset identifier.',
+    source_ref             STRING             COMMENT 'Source dataset identifier: the building''s sources.source_ref, or <source_ref>-<subcode> (NSI-P, NSI-H).',
     crs                    STRING    NOT NULL COMMENT 'EPSG string for the geometry in this row; must equal the geom column CRS (EPSG:3857).',
     geom                   GEOMETRY(3857) NOT NULL COMMENT 'Native Iceberg v3 geometry, EPSG:3857. Sedona reads via ST_GeomFromWKB(spark_st_asbinary(geom)); writes via spark_st_setsrid(spark_st_geomfromwkb(wkb), 3857).',
     ingested_at            TIMESTAMP NOT NULL COMMENT 'When this row was last written (insert, or update by a load that changed it).'
@@ -109,6 +120,21 @@ TBLPROPERTIES (
     'write.update.mode' = 'merge-on-read',
     'write.merge.mode'  = 'merge-on-read'
 );
+
+-- -----------------------------------------------------------------------------
+-- sources: registry of the inventories loaded into buildings (ADR-multi-source).
+-- Upserted from the source's YAML spec on every load, on main only (never
+-- branched), and never deleted, so every version's source_ref values resolve.
+-- -----------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS rqm.inventory.sources (
+    source_ref   STRING    NOT NULL COMMENT 'PK; matches buildings.source_ref. Upper-case letters, digits, ".", "_", "-"; names a dataset lineage, stable across releases.',
+    source_name  STRING    NOT NULL COMMENT 'Human-readable name.',
+    source_kind  STRING    NOT NULL COMMENT 'Enum source_kind: national_inventory | local_inventory | commercial_inventory | project_inventory | field_survey | remote_sensing | other.',
+    description  STRING             COMMENT 'Free text.',
+    spec_sha256  STRING             COMMENT 'SHA-256 of the YAML mapping spec last used to load the source.',
+    updated_at   TIMESTAMP NOT NULL COMMENT 'When this row was last written.'
+) USING iceberg
+TBLPROPERTIES ('format-version' = '3');
 
 -- -----------------------------------------------------------------------------
 -- inventory_versions: version registry. One row per named inventory version.
@@ -122,6 +148,7 @@ CREATE TABLE IF NOT EXISTS rqm.inventory.inventory_versions (
     merged_version         STRING             COMMENT 'For kind=merge: the branch version merged in.',
     branch                 STRING    NOT NULL COMMENT 'Iceberg branch the version was committed on (main or a project branch).',
     kind                   STRING    NOT NULL COMMENT 'release | edit | merge (enum version_kind).',
+    source_ref             STRING             COMMENT 'FK -> sources.source_ref: the source a release loaded (NULL for edits, merges, and versions committed before multi-source support).',
     source_uri             STRING             COMMENT 'Input file loaded for this version (NULL for in-place edits and merges).',
     source_sha256          STRING             COMMENT 'SHA-256 of the input file.',
     editor                 STRING    NOT NULL COMMENT 'Who committed the version.',

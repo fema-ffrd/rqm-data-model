@@ -1,0 +1,69 @@
+# Built-in source spec: the National Structure Inventory (ADR-multi-source).
+#
+# An identity mapping: every NSI parquet column maps to the same-named
+# buildings column (NSI's field set is the shared schema every source maps
+# onto). NSI rows keep their native ids (building_id = fd_id; ADR-nsi-minimal
+# rule 7), which only this spec may use. Geometries are tagged
+# NSI-<source> (NSI-P, NSI-H) from the per-structure `source` code.
+# `x` / `y` are WGS84 lon / lat in NSI, so they are mapped as published.
+#
+# Loaded by ingest_nsi.load_buildings / load_geometries; keep `fields` equal
+# to ingest_nsi.NSI_SCALAR_FIELDS.
+source_ref: NSI
+source_name: National Structure Inventory
+source_kind: national_inventory
+description: >
+  USACE National Structure Inventory (NSI) point inventory: one point per
+  structure with occupancy, valuation, foundation, population, and FIRM
+  attributes.
+input:
+  format: parquet
+  crs: EPSG:3857
+  geometry: {kind: point, column: shape, subcode: source}
+id: {column: fd_id, scheme: native}
+fields:
+  fd_id: fd_id
+  bid: bid
+  usastrucid: usastrucid
+  ftprntid: ftprntid
+  ftprntsrc: ftprntsrc
+  source: source
+  occtype: occtype
+  st_damcat: st_damcat
+  bldgtype: bldgtype
+  num_story: num_story
+  sqft: sqft
+  ftprntsqft: ftprntsqft
+  bldheight: bldheight
+  med_yr_blt: med_yr_blt
+  found_type: found_type
+  found_ht: found_ht
+  val_struct: val_struct
+  val_cont: val_cont
+  val_vehic: val_vehic
+  ornl_low: ornl_low
+  ornl_med: ornl_med
+  ornl_hgh: ornl_hgh
+  resunits: resunits
+  novehprob: novehprob
+  vehperunit: vehperunit
+  pop2amu65: pop2amu65
+  pop2amo65: pop2amo65
+  pop2pmu65: pop2pmu65
+  pop2pmo65: pop2pmo65
+  u65disable: u65disable
+  o65disable: o65disable
+  students: students
+  firmzone: firmzone
+  zone_sub: zone_sub
+  static_bfe: static_bfe
+  ground_elv: ground_elv
+  grnd_elv_m: grnd_elv_m
+  pctlowclr: pctlowclr
+  fullrep: fullrep
+  depindex: depindex
+  creprcnt: creprcnt
+  crerank: crerank
+  cbfips: cbfips
+  x: x
+  y: y

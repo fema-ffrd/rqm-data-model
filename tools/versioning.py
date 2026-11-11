@@ -9,10 +9,13 @@ A *version* is a named, immutable state of the inventory:
 - per-building rows in `inventory_changes` describing what changed relative
   to the parent version.
 
-Loads are full-replacement MERGE upserts (`ingest_nsi.load_buildings` /
-`load_geometries`), so each Iceberg snapshot holds only the rows that changed
-(merge-on-read deletion vectors) and every earlier version stays readable
-with `VERSION AS OF '<version>'`.
+Loads are MERGE upserts that fully replace one source's rows
+(`ingest_source.load_source`; `ingest_nsi.load_buildings` /
+`load_geometries` for NSI), so each Iceberg snapshot holds only the rows that
+changed (merge-on-read deletion vectors) and every earlier version stays
+readable with `VERSION AS OF '<version>'`. Several sources sit side by side
+in the same tables (ADR-multi-source); diffs, merges, and branches key on
+`building_id` and work across them unchanged.
 
 Project inventories are Iceberg **branches** of the same name on both tables,
 created from a version. A branch is merged back by fast-forward when the
@@ -41,10 +44,14 @@ from ingest_nsi import (
     BUILDING_COMPARE_COLUMNS,
     BUILDINGS_COLUMNS,
     NAMESPACE,
+    NSI_SOURCE_REF,
+    conform_buildings,
     ref_snapshot_id,
+    source_building_id_sql,
     table_name,
     validate_ref_name,
 )
+from ingest_source import get_source
 from pyspark.sql import DataFrame, Row, SparkSession
 from pyspark.sql import functions as F
 
@@ -277,10 +284,17 @@ def table_at(
     snapshot_id: int,
     namespace: str = NAMESPACE,
 ) -> DataFrame:
-    """`table` as of an Iceberg snapshot id."""
-    return spark.sql(
+    """`table` as of an Iceberg snapshot id.
+
+    Iceberg reads a snapshot with the schema it was written with, so
+    `buildings` snapshots from before the multi-source migration lack
+    `source_ref` / `source_record_id`; they are conformed to the current
+    columns (`ingest_nsi.conform_buildings`).
+    """
+    df = spark.sql(
         f"SELECT * FROM {_fq(catalog, table, namespace)} VERSION AS OF {int(snapshot_id)}"
     )
+    return conform_buildings(df) if table == "buildings" else df
 
 
 def read_version(
@@ -464,11 +478,15 @@ def commit_version(
     kind: str = "release",
     parent: str | None = None,
     merged_version: str | None = None,
+    source_ref: str | None = None,
     source_uri: str | None = None,
     source_sha256: str | None = None,
     namespace: str = NAMESPACE,
 ) -> dict:
     """Record the current head of `branch` as version `version`.
+
+    `source_ref` names the source a release loaded (it must be registered in
+    `sources`); leave it None for edits and merges.
 
     Steps: resolve the parent (default: `nearest_version` of the branch
     head), write the per-building changes relative to it into
@@ -494,6 +512,8 @@ def commit_version(
         get_version(spark, catalog, parent, namespace)
     if merged_version is not None:
         get_version(spark, catalog, merged_version, namespace)
+    if source_ref is not None:
+        get_source(spark, catalog, source_ref, namespace)
 
     changes_fq = _fq(catalog, "inventory_changes", namespace)
     stale = spark.table(changes_fq).where(F.col("version_name") == version)
@@ -539,8 +559,12 @@ def commit_version(
     spark.sql(
         f"""
         INSERT INTO {_fq(catalog, "inventory_versions", namespace)}
+            (version_name, parent_version, merged_version, branch, kind,
+             source_ref, source_uri, source_sha256, editor, reason,
+             buildings_snapshot_id, geometries_snapshot_id,
+             n_buildings, n_added, n_removed, n_changed, created_at)
         VALUES (:version_name, :parent_version, :merged_version, :branch, :kind,
-                :source_uri, :source_sha256, :editor, :reason,
+                :source_ref, :source_uri, :source_sha256, :editor, :reason,
                 :buildings_snapshot_id, :geometries_snapshot_id,
                 :n_buildings, :n_added, :n_removed, :n_changed,
                 current_timestamp())
@@ -551,6 +575,7 @@ def commit_version(
             "merged_version": merged_version,
             "branch": branch,
             "kind": kind,
+            "source_ref": source_ref,
             "source_uri": source_uri,
             "source_sha256": source_sha256,
             "editor": editor,
@@ -940,16 +965,27 @@ def check_inventory_invariants(
     snapshots: Snapshots,
     namespace: str = NAMESPACE,
 ) -> list[str]:
-    """ADR-nsi-minimal rules 1, 2, and 7 (plus the geometry FK) at one state."""
+    """ADR-nsi-minimal rules 1, 2, and 7 (plus the geometry FK) and the
+    ADR-multi-source identity rules at one state.
+
+    Every `source_ref` must be non-null and registered in `sources` (read at
+    the head of main; rows are never deleted). Rule 7 (`building_id =
+    fd_id`) applies to NSI rows; every other row's `building_id` must equal
+    the hash of (source_ref, source_record_id).
+    """
     buildings = table_at(spark, catalog, "buildings", snapshots["buildings"], namespace)
     geometries = table_at(
         spark, catalog, "geometries", snapshots["geometries"], namespace
     )
     buildings.createOrReplaceTempView("_rqm_check_b")
     geometries.createOrReplaceTempView("_rqm_check_g")
+    spark.table(_fq(catalog, "sources", namespace)).createOrReplaceTempView(
+        "_rqm_check_s"
+    )
+    hashed_id = source_building_id_sql("source_ref", "source_record_id")
     try:
         row = spark.sql(
-            """
+            f"""
             SELECT
               (SELECT COUNT(*) FROM _rqm_check_b b LEFT ANTI JOIN _rqm_check_g g
                  ON g.building_id = b.building_id AND g.role = 'point'
@@ -962,21 +998,35 @@ def check_inventory_invariants(
                 AS multi_selected,
               (SELECT COUNT(*) - COUNT(DISTINCT building_id) FROM _rqm_check_b)
                 AS duplicate_ids,
-              (SELECT COUNT(*) FROM _rqm_check_b WHERE NOT (building_id <=> fd_id))
+              (SELECT COUNT(*) FROM _rqm_check_b
+                 WHERE source_ref = '{NSI_SOURCE_REF}' AND NOT (building_id <=> fd_id))
                 AS id_not_fd_id,
+              (SELECT COUNT(*) FROM _rqm_check_b
+                 WHERE source_ref <> '{NSI_SOURCE_REF}'
+                   AND NOT (building_id <=> {hashed_id}))
+                AS id_not_hash,
+              (SELECT COUNT(*) FROM _rqm_check_b WHERE source_ref IS NULL)
+                AS null_source,
+              (SELECT COUNT(*) FROM _rqm_check_b b LEFT ANTI JOIN _rqm_check_s s
+                 ON b.source_ref = s.source_ref WHERE b.source_ref IS NOT NULL)
+                AS unregistered_source,
               (SELECT COUNT(*) FROM _rqm_check_g g LEFT ANTI JOIN _rqm_check_b b
                  ON g.building_id = b.building_id)
                 AS orphan_geometries
             """
         ).collect()[0]
     finally:
-        spark.catalog.dropTempView("_rqm_check_b")
-        spark.catalog.dropTempView("_rqm_check_g")
+        for view in ("_rqm_check_b", "_rqm_check_g", "_rqm_check_s"):
+            spark.catalog.dropTempView(view)
     messages = {
         "no_point": "buildings without a selected computation point (rule 1)",
         "multi_selected": "buildings without exactly one selected computation geometry (rule 2)",
         "duplicate_ids": "duplicate building_id values (rule 7)",
-        "id_not_fd_id": "buildings whose building_id differs from fd_id (rule 7)",
+        "id_not_fd_id": "NSI buildings whose building_id differs from fd_id (rule 7)",
+        "id_not_hash": "non-NSI buildings whose building_id is not the hash of "
+        "(source_ref, source_record_id)",
+        "null_source": "buildings without a source_ref",
+        "unregistered_source": "buildings whose source_ref is not in sources",
         "orphan_geometries": "geometries whose building is missing",
     }
     return [f"{row[k]} {msg}" for k, msg in messages.items() if row[k]]
@@ -1130,6 +1180,7 @@ def write_export_manifest(
         "branch": row["branch"],
         "kind": row["kind"],
         "parent_version": row["parent_version"],
+        "source_ref": row["source_ref"],
         "editor": row["editor"],
         "reason": row["reason"],
         "version_created_at": row["created_at"].isoformat(),
@@ -1156,29 +1207,85 @@ def export_version(
     out_dir: str | Path,
     *,
     where: str | None = None,
+    sources: Iterable[str] | None = None,
     namespace: str = NAMESPACE,
 ) -> dict:
     """Export `version` as one parquet file plus a pinning manifest.
 
+    `sources` keeps only buildings of those registered `source_ref`s, and
     `where` is an optional SQL filter on the export columns (e.g.
-    `"cbfips LIKE '48113%'"`). The data is read at the version's snapshots,
-    so exporting the same version again later gives the same rows however
-    the inventory has changed since. Returns the manifest.
+    `"cbfips LIKE '48113%'"`). Sources are side by side, so one structure
+    can appear once per source; select sources explicitly for aggregates
+    that must not double count. The data is read at the version's
+    snapshots, so exporting the same version again later gives the same rows
+    however the inventory has changed since. Returns the manifest, which
+    records the source filter and the exported row count per source.
     """
+    selected = None
+    if sources is not None:
+        selected = sorted(set(sources))
+        if not selected:
+            raise ValueError("sources must name at least one source")
+        for ref in selected:
+            get_source(spark, catalog, ref, namespace)
     frame = version_export_frame(spark, catalog, version, namespace)
+    if selected is not None:
+        frame = frame.where(F.col("source_ref").isin(selected))
     if where:
         frame = frame.where(where)
     out = Path(out_dir)
     frame.orderBy("building_id").coalesce(1).write.mode("overwrite").parquet(str(out))
-    n_rows = spark.read.parquet(str(out)).count()
+    exported = spark.read.parquet(str(out))
+    per_source = {
+        r["source_ref"]: r["count"]
+        for r in exported.groupBy("source_ref").count().orderBy("source_ref").collect()
+    }
     return write_export_manifest(
         spark,
         catalog,
         version,
         out,
-        extra={"row_count": n_rows, "filter": where},
+        extra={
+            "row_count": sum(per_source.values()),
+            "filter": where,
+            "sources": selected,
+            "rows_by_source": per_source,
+        },
         namespace=namespace,
     )
+
+
+def source_counts(
+    spark: SparkSession, catalog: str, namespace: str = NAMESPACE
+) -> DataFrame:
+    """Buildings per source in every registered version, oldest version first.
+
+    Columns: version_name, branch, created_at, source_ref, n_buildings.
+    """
+    registry = list_versions(spark, catalog, namespace).collect()
+    frames = [
+        table_at(spark, catalog, "buildings", row["buildings_snapshot_id"], namespace)
+        .groupBy("source_ref")
+        .agg(F.count("*").alias("n_buildings"))
+        .select(
+            F.lit(row["version_name"]).alias("version_name"),
+            F.lit(row["branch"]).alias("branch"),
+            F.lit(row["created_at"]).alias("created_at"),
+            "source_ref",
+            "n_buildings",
+        )
+        for row in registry
+    ]
+    if not frames:
+        return spark.sql(
+            "SELECT CAST(NULL AS STRING) AS version_name, CAST(NULL AS STRING) AS branch, "
+            "CAST(NULL AS TIMESTAMP) AS created_at, CAST(NULL AS STRING) AS source_ref, "
+            "CAST(0 AS BIGINT) AS n_buildings"
+        ).limit(0)
+    result = frames[0]
+    for frame in frames[1:]:
+        result = result.unionByName(frame)
+    return result.orderBy("created_at", "version_name", "source_ref")
 
 
 # ---------------------------------------------------------------------------

@@ -5,8 +5,8 @@
 **Date:** 2026-11-10
 **Builds on:** ADR-nsi-minimal (replaces its "Bitemporal identity + branching" deferral)
 **Serves user stories:** RQM-02, RQM-03, RQM-11, RQM-12, RQM-16
-**Implementation:** `tools/schema.sql`, `tools/ingest_nsi.py`, `tools/versioning.py`, `tools/rqm_version.py`
-**Tests / demo:** `test/test_versioning.py`, `notebooks/nsi_versioning_demo.ipynb`
+**Implementation:** `tools/schema.sql`, `tools/ingest_nsi.py`, `tools/ingest_source.py`, `tools/versioning.py`, `tools/rqm_version.py`
+**Tests / demo:** `test/test_versioning.py`, `notebooks/02_versioning_demo.ipynb`
 
 ## Context
 
@@ -34,13 +34,13 @@ The hybrid exploration (`feature/hybrid_data_model`) answered this with five tab
 | Same `building_id`, identical | **no write** |
 | `building_id` missing from the input | delete from the branch head (earlier versions keep it) |
 
-The input is the complete inventory for the branch. Geometries follow the same rules, keyed on the stable `geometry_id`:
+The input is the complete inventory **of its source** for the branch. Since [ADR-multi-source](ADR-multi-source.md), the delete is scoped to `buildings.source_ref`, so a load never touches other sources' rows. Geometries follow the same rules, keyed on the stable `geometry_id`:
 
 - Only the point and CRS are compared; `is_selected_for_export` is never overwritten, so a selection migration survives a reload.
-- Only NSI rows (`source_ref LIKE 'NSI-%'`) are deleted when they are missing from the input.
-- Geometries from any other source are deleted when their building is gone.
+- Only the loading source's own geometries (`source_ref` = `<source>` or `<source>-<subcode>`, e.g. `NSI-P`) of its own buildings are deleted when they are missing from the input.
+- Geometries from any source are deleted when their building is gone.
 
-Identity is unchanged: `building_id` = `fd_id` and `geometry_id` = hash of the natural key, so the same structure has the same ids in every version (RQM-02).
+Identity is unchanged: `building_id` = `fd_id` for NSI (a stable hash of the native id for other sources), and `geometry_id` = hash of the natural key, so the same structure has the same ids in every version (RQM-02).
 
 `buildings` and `geometries` use **merge-on-read** writes (`write.{delete,update,merge}.mode`). A version stores only the rows that changed, plus Iceberg v3 deletion vectors that mask the rows they replace. On the 45,622-row sample, v2 (205 changed buildings) adds 165 records and one deletion vector to `buildings`, not a 45,597-row copy (RQM-11, minimal footprint).
 
@@ -61,7 +61,7 @@ Any version can be read with plain SQL, `SELECT … FROM rqm.inventory.buildings
 
 | Table | Grain | Purpose |
 |---|---|---|
-| `inventory_versions` | one row per version | `version_name` (= tag), `parent_version`, `merged_version`, `branch`, `kind` (release / edit / merge), `source_uri` + `source_sha256`, `editor`, `reason`, both snapshot ids, `n_buildings` / `n_added` / `n_removed` / `n_changed`, `created_at` |
+| `inventory_versions` | one row per version | `version_name` (= tag), `parent_version`, `merged_version`, `branch`, `kind` (release / edit / merge), `source_ref` (the source a release loaded; ADR-multi-source), `source_uri` + `source_sha256`, `editor`, `reason`, both snapshot ids, `n_buildings` / `n_added` / `n_removed` / `n_changed`, `created_at` |
 | `inventory_changes` | one row per (version, building) changed relative to the parent | `change_kind` (added / removed / modified) and `changed_columns` (buildings columns, plus `geom` when the selected computation geometry changed) |
 
 Root versions (no parent) have no `inventory_changes` rows; every building in them counts as added. `building_history(building_id)` joins the change log with the registry to answer "who changed this building, when, and why" (RQM-16).
@@ -72,7 +72,7 @@ Root versions (no parent) have no `inventory_changes` rows; every building in th
 
 ### 5. Branches and merges
 
-A project inventory is an Iceberg **branch** with the same name on both tables, created from a version (`create_branch`). Writes go through `rqm.inventory.<table>.branch_<name>`: `ingest_nsi --branch`, or Spark SQL `UPDATE` / `DELETE` / `MERGE`. Edits on a branch become a version when they are committed with `branch=<name>`.
+A project inventory is an Iceberg **branch** with the same name on both tables, created from a version (`create_branch`). Writes go through `rqm.inventory.<table>.branch_<name>`: `ingest_nsi --branch`, `ingest_source --branch`, or Spark SQL `UPDATE` / `DELETE` / `MERGE`. Edits on a branch become a version when they are committed with `branch=<name>`.
 
 `merge_branch(branch, version=...)` requires the branch head to be a committed version. It then works as follows:
 
@@ -88,7 +88,7 @@ Merges never resolve conflicts automatically, and conflicts are detected per bui
 
 ### 6. Pinned exports (run reproducibility)
 
-`export_version(version, out_dir)` reads the version at its recorded snapshot ids and writes parquet plus `_rqm_version.json`. The manifest holds the version, catalog, namespace, both snapshot ids, provenance (editor, reason, source hash), row count, and filter. Re-exporting from a manifest reproduces the data however far the inventory has moved on (RQM-03). The demo notebook checks this byte for byte.
+`export_version(version, out_dir)` reads the version at its recorded snapshot ids and writes parquet plus `_rqm_version.json`. The manifest holds the version, catalog, namespace, both snapshot ids, provenance (editor, reason, source, source hash), row count, and filter. `export_version(..., sources=[...])` exports only the chosen sources, and the manifest records them along with the row count per source (ADR-multi-source). Re-exporting from a manifest reproduces the data however far the inventory has moved on (RQM-03). The demo notebook checks this byte for byte.
 
 ### 7. Catalog: JDBC (SQLite by default) replaces Hadoop
 
@@ -108,7 +108,7 @@ The Hadoop catalog commits by renaming files in the warehouse. That is unsafe on
 3. Version names are unique, are not branch names, and match `[A-Za-z0-9][A-Za-z0-9_.-]*` (not starting with `branch_`).
 4. `parent_version` and `merged_version` resolve, and parent chains have no cycles.
 5. `inventory_changes` counts per version equal the registry's `n_added` / `n_removed` / `n_changed`.
-6. ADR-nsi-minimal rules 1, 2, and 7 hold, and every geometry has a building, **at every version**, not only at the head.
+6. ADR-nsi-minimal rules 1, 2, and 7 hold, and every geometry has a building, **at every version**, not only at the head. Since ADR-multi-source, rule 7 applies to NSI rows, every other row's `building_id` must be the hash of `(source_ref, source_record_id)`, and every `source_ref` must be registered in `sources`.
 
 Tags never expire by default (Iceberg tags have no `max-ref-age` unless one is set). `expire_snapshots` keeps any snapshot a tag or branch references, so all versions survive routine maintenance. Do not set a `max-ref-age` on version tags.
 
@@ -135,7 +135,7 @@ A further branch, `review-x`, edits the `found_ht` of one building while main (`
 - **Multi-table atomic commits.** These need a catalog with multi-table transactions, such as Nessie once it supports Iceberg v3 or a REST catalog that implements them. Until then, the registry row is the commit marker.
 - **Column-level merge and automatic conflict resolution.** Any building changed differently on both sides conflicts, even when the changed columns don't overlap.
 - **GIS-native editing (RQM-12).** Today the workflow is: export a version, edit it in QGIS or ArcGIS, and reload the edited file onto a branch with `--editor` / `--reason`. A plugin is out of scope.
-- **Hybrid identity tables** (`asset`, `asset_revision`): not needed while `building_id` = `fd_id` is stable. Reconsider when a non-NSI source needs its own id scheme.
+- **Hybrid identity tables** (`asset`, `asset_revision`): still not needed. NSI keeps `building_id` = `fd_id`, and since ADR-multi-source, other sources get deterministic hashes of their native ids.
 
 ## Alternatives considered
 
@@ -148,4 +148,5 @@ A further branch, `review-x`, edits the `found_ht` of one building while main (`
 ## Impact on other ADRs
 
 - **ADR-nsi-minimal:** the "Bitemporal identity + branching" re-entry row is resolved by this ADR. `ingested_at` now means "last written", and history lives in Iceberg snapshots plus the registry.
+- **ADR-multi-source:** several inventories share the versioned tables. Loads are scoped to their source, `inventory_versions.source_ref` records the source a release loaded, and versions taken before the multi-source migration lack the new `buildings` columns. `table_at` conforms them (NULL or missing `source_ref` → `NSI`), so diffs across the migration show no spurious changes. Diffs, merges, and branches key on `building_id` and are unchanged.
 - **Future domains** (hazard links, loss realizations, exports): pin inputs by version name or snapshot ids, as `export_version` does, rather than reading the head.

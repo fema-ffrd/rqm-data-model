@@ -2,11 +2,14 @@
 %% Risk Quantification Methodology (RQM) Data Model — NSI-Minimal ERD
 %% Iceberg v3 tables in namespace rqm.inventory. Apache Sedona is the query engine.
 %% -
-%% buildings  : one row per NSI structure; every NSI parquet column maps 1:1.
+%% buildings  : one row per structure per source inventory, on the NSI
+%%              field set (every NSI parquet column maps 1:1). Sources sit
+%%              side by side, scoped by source_ref (ADR-multi-source).
+%% sources    : registry of loaded inventories (NSI, assessor rolls, ...).
 %% geometries : first-class multi-geometry attach (ADR-geometry preserved).
 %%              Point for role='point', Polygon/MultiPolygon for role='footprint'.
-%%              NSI load creates one point row per building; alternate
-%%              footprint sources (MSBF, USAS) land as additional rows.
+%%              Every load creates one computation point per building;
+%%              polygon sources also add a display footprint.
 %% -
 %% inventory_versions : version registry. Each version_name is also an Iceberg
 %%                      tag on buildings + geometries (ADR-versioning).
@@ -20,7 +23,9 @@
 erDiagram
 
   buildings {
-    bigint      building_id PK "= fd_id"
+    bigint      building_id PK "NSI: fd_id; else hash(source_ref, source_record_id)"
+    varchar     source_ref FK
+    varchar     source_record_id
     bigint      fd_id
     varchar     bid
     varchar     usastrucid
@@ -82,12 +87,22 @@ erDiagram
     timestamp   ingested_at
   }
 
+  sources {
+    varchar     source_ref PK
+    varchar     source_name
+    varchar     source_kind
+    varchar     description
+    varchar     spec_sha256
+    timestamp   updated_at
+  }
+
   inventory_versions {
     varchar     version_name PK "= Iceberg tag"
     varchar     parent_version FK
     varchar     merged_version FK
     varchar     branch
     varchar     kind
+    varchar     source_ref FK
     varchar     source_uri
     varchar     source_sha256
     varchar     editor
@@ -108,6 +123,8 @@ erDiagram
     varchar[]   changed_columns
   }
 
+  sources ||--o{ buildings : "supplies"
+  sources |o--o{ inventory_versions : "loaded by release"
   buildings ||--o{ geometries : "has 1..N representations"
   inventory_versions ||--o{ inventory_changes : "records changes vs. parent"
   buildings ||--o{ inventory_changes : "changed in"

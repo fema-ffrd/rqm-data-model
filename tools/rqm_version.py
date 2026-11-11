@@ -10,14 +10,19 @@ Usage
     python tools/rqm_version.py --warehouse WH branch merge calibration \\
         --version nsi-2025-cal --editor jdoe --reason "found_ht survey"
     python tools/rqm_version.py --warehouse WH branch drop calibration
-    python tools/rqm_version.py --warehouse WH export nsi-2025 out/ [--where SQL]
+    python tools/rqm_version.py --warehouse WH export nsi-2025 out/ [--where SQL] \
+        [--source NSI --source COUNTY-ASSESSOR]
+    python tools/rqm_version.py --warehouse WH sources list
+    python tools/rqm_version.py --warehouse WH sources show COUNTY-ASSESSOR
     python tools/rqm_version.py --warehouse WH check
 
-Versions are created by loading data: `ingest_nsi.py --version NAME` (onto
-main or `--branch`). Edits made directly on a branch with Spark SQL are
-committed with `versioning.commit_version`. Session and catalog options are
-the same as for `ingest_nsi.py` (`--catalog`, `--namespace`,
-`--catalog-type`, `--catalog-prop`, `--master`, `--conf`).
+Versions are created by loading data: `ingest_nsi.py --version NAME` or
+`ingest_source.py --spec SPEC --version NAME` (onto main or `--branch`).
+Edits made directly on a branch with Spark SQL are committed with
+`versioning.commit_version`. Session and catalog options are the same as for
+`ingest_nsi.py` (`--catalog`, `--namespace`, `--catalog-type`,
+`--catalog-prop`, `--master`, `--conf`). Every command first applies the
+idempotent schema migration (`ingest_nsi.apply_schema`).
 """
 
 from __future__ import annotations
@@ -28,6 +33,7 @@ import sys
 
 from ingest_nsi import (
     add_session_arguments,
+    apply_schema,
     build_spark,
     default_editor,
     settings_from_args,
@@ -77,6 +83,21 @@ def _parser() -> argparse.ArgumentParser:
     export.add_argument(
         "--where", default=None, help="SQL filter, e.g. \"occtype = 'RES1'\"."
     )
+    export.add_argument(
+        "--source",
+        dest="sources",
+        action="append",
+        default=None,
+        metavar="REF",
+        help="Export only this source's buildings; repeatable (default: all sources).",
+    )
+
+    sources = sub.add_parser(
+        "sources", help="Registered building sources."
+    ).add_subparsers(dest="sources_command", required=True)
+    sources.add_parser("list", help="List sources with their building count on main.")
+    show = sources.add_parser("show", help="One source: registry row and history.")
+    show.add_argument("source_ref")
 
     sub.add_parser("check", help="Check registry, tags, change log, and invariants.")
     return ap
@@ -89,6 +110,7 @@ def main(argv: list[str] | None = None) -> int:
     spark = build_spark(settings_from_args(args))
     cat, ns = args.catalog, args.namespace
     try:
+        apply_schema(spark, cat, namespace=ns)
         if args.command == "list":
             v.list_versions(spark, cat, ns).drop(
                 "source_uri", "buildings_snapshot_id", "geometries_snapshot_id"
@@ -132,9 +154,17 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"OK: branch {args.name!r} dropped.")
         elif args.command == "export":
             manifest = v.export_version(
-                spark, cat, args.version, args.out_dir, where=args.where, namespace=ns
+                spark,
+                cat,
+                args.version,
+                args.out_dir,
+                where=args.where,
+                sources=args.sources,
+                namespace=ns,
             )
             print(json.dumps(manifest, indent=2))
+        elif args.command == "sources":
+            return _sources_command(spark, args)
         elif args.command == "check":
             problems = v.check_consistency(spark, cat, ns)
             for problem in problems:
@@ -144,6 +174,42 @@ def main(argv: list[str] | None = None) -> int:
             print("OK: versions, tags, change log, and invariants are consistent.")
     finally:
         spark.stop()
+    return 0
+
+
+def _sources_command(spark, args: argparse.Namespace) -> int:
+    import ingest_source as src
+    import versioning as v
+    from ingest_nsi import table_name
+    from pyspark.sql import functions as F
+
+    cat, ns = args.catalog, args.namespace
+    if args.sources_command == "list":
+        on_main = (
+            v.conform_buildings(spark.table(table_name(cat, "buildings", ns)))
+            .groupBy("source_ref")
+            .agg(F.count("*").alias("n_buildings_main"))
+        )
+        src.list_sources(spark, cat, ns).join(on_main, "source_ref", "left").orderBy(
+            "source_ref"
+        ).show(100, truncate=40)
+        return 0
+    try:
+        row = src.get_source(spark, cat, args.source_ref, ns)
+    except KeyError as err:
+        print(f"error: {err.args[0]}", file=sys.stderr)
+        return 1
+    print(json.dumps(row.asDict(), indent=2, default=str))
+    print("\nVersions that loaded this source:")
+    v.list_versions(spark, cat, ns).where(
+        F.col("source_ref") == args.source_ref
+    ).select(
+        "version_name", "branch", "kind", "editor", "reason", "source_uri", "created_at"
+    ).show(100, truncate=40)
+    print("Buildings of this source per version:")
+    v.source_counts(spark, cat, ns).where(F.col("source_ref") == args.source_ref).drop(
+        "source_ref"
+    ).show(100, truncate=False)
     return 0
 
 

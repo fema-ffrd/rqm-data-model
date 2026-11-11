@@ -26,9 +26,10 @@ Keep large NSI inputs, Iceberg warehouses, and exports there:
 ```
 /data/rqm/
 ├── data/nsi2026_public_wkb.parquet   # nationwide NSI input
-├── warehouse-notebook/               # Iceberg warehouse (nsi_demo.ipynb)
+├── warehouse-notebook/               # Iceberg warehouse (01_setup_demo.ipynb)
 ├── exports-notebook/                 # analysis-ready exports
-└── versioning-notebook/              # nsi_versioning_demo.ipynb scratch (recreated each run)
+├── versioning-notebook/              # 02_versioning_demo.ipynb scratch (recreated each run)
+└── multi-source-notebook/            # 03_multi_source_demo.ipynb scratch (recreated each run)
 ```
 
 After the first rebuild with the volume, copy the nationwide file in once
@@ -38,7 +39,7 @@ After the first rebuild with the volume, copy the nationwide file in once
 cp test/data/nsi2026_public_wkb.parquet "$RQM_DATA_DIR/data/"
 ```
 
-`notebooks/nsi_demo.ipynb` reads from `RQM_DATA_DIR` automatically. For the CLI,
+`notebooks/01_setup_demo.ipynb` reads from `RQM_DATA_DIR` automatically. For the CLI,
 pass volume paths explicitly:
 
 ```bash

@@ -42,7 +42,7 @@ Occupancy, damage category, foundation type, and FIRM zone are inlined as `varch
 
 ### Identity and versioning
 
-`building_id` is the structure identity; it equals the NSI `fd_id`, so a structure keeps its id across re-ingests. `geometry_id` is likewise deterministic: the xxhash64 of the row's natural key `(source_ref, building_id, role, purpose, alt_group_key)`, so a geometry keeps its id across re-ingests and selection migrations, and the ingest refuses a write whose id collides with a different natural key. Versioning is defined by [ADR-versioning](ADR-versioning.md): loads are MERGE upserts, named versions are Iceberg tags recorded in `inventory_versions`, and per-building changes are recorded in `inventory_changes`. `ingested_at` records when a row was last written. The hybrid branch's `asset` / `asset_revision` / `inventory_branch` / `revision_log` / `versioning` split is not needed while these ids are stable.
+`building_id` is the structure identity; for NSI rows it equals the NSI `fd_id`, so a structure keeps its id across re-ingests. Other inventories load beside NSI with hashed ids ([ADR-multi-source](ADR-multi-source.md)). `geometry_id` is likewise deterministic: the xxhash64 of the row's natural key `(source_ref, building_id, role, purpose, alt_group_key)`, so a geometry keeps its id across re-ingests and selection migrations, and the ingest refuses a write whose id collides with a different natural key. Versioning is defined by [ADR-versioning](ADR-versioning.md): loads are MERGE upserts, named versions are Iceberg tags recorded in `inventory_versions`, and per-building changes are recorded in `inventory_changes`. `ingested_at` records when a row was last written. The hybrid branch's `asset` / `asset_revision` / `inventory_branch` / `revision_log` / `versioning` split is not needed while these ids are stable.
 
 ## Validation rules
 
@@ -54,7 +54,7 @@ Logical invariants enforced by the ingest script (`tools/ingest_nsi.py`) and ass
 4. `crs` is a well-formed EPSG string (the NSI load sets `EPSG:3857`).
 5. `buildings.occtype` is non-null for every row (NSI always publishes it).
 6. The ingest's row count equals the NSI parquet's row count; the `geometries` row count equals the same number when only the NSI point source is loaded.
-7. `buildings.building_id` equals `fd_id` and is unique.
+7. `buildings.building_id` is unique, and for NSI rows (`source_ref = 'NSI'`) it equals `fd_id`. *Amended by [ADR-multi-source](ADR-multi-source.md):* rows from every other source have `building_id = xxhash64(source_ref, source_record_id)` with the sign bit set.
 
 ## Alternatives considered
 
@@ -75,8 +75,8 @@ Nothing from the hybrid exploration is lost — the full dictionary and ERD sit 
 | Hazard links | `events`, `hazard_links` | Standalone `events`; `hazard_links` FKs on `buildings.building_id` and references the hazard-grid URI. |
 | Depth-damage functions | `ddf_library`, `ddf_uncertainty` | No inventory dependency; keyed on `occtype` + `found_type` enums that already exist here. |
 | Loss realizations | `loss_realizations`, `mv_loss_summary` | Iceberg tables keyed on `building_id` + `event_id` + `realization_id`. No schema change to the core. |
-| Provenance registry | `prov_agent`, `prov_activity`, `source_registry`, `source_observation`, `adopted_value_link` | Soft references via `buildings.source` and `geometries.source_ref` seed the future registry. |
-| Bitemporal identity + branching | `asset`, `asset_revision`, `inventory_branch`, `revision_log`, `versioning` | **Resolved by [ADR-versioning](ADR-versioning.md):** Iceberg tags and branches plus `inventory_versions` / `inventory_changes`. Still deferred: valid time, and identity tables for non-NSI id schemes. |
+| Provenance registry | `prov_agent`, `prov_activity`, `source_registry`, `source_observation`, `adopted_value_link` | **Partly resolved by [ADR-multi-source](ADR-multi-source.md):** the `sources` registry and `buildings.source_ref` / `source_record_id` record which inventory every row came from. Still deferred: per-value provenance and adoption ([ADR-restricted-sources](ADR-restricted-sources.md), *Proposed*). |
+| Bitemporal identity + branching | `asset`, `asset_revision`, `inventory_branch`, `revision_log`, `versioning` | **Resolved by [ADR-versioning](ADR-versioning.md):** Iceberg tags and branches plus `inventory_versions` / `inventory_changes`. Non-NSI id schemes are resolved by [ADR-multi-source](ADR-multi-source.md) (hashed ids, no identity tables). Still deferred: valid time. |
 | Export contracts | `export_contract`, `export_product`, `export_lossiness_report` | Return as a separate `exports` domain; discriminator enum re-adds `'buildings'` and `'geometries'`. |
 | 3D geometry roles + component-level geometry | `geometries.role` 3D values, `geometries.component_id` | Role enum extends to include `envelope_3d` / `detailed_3d`; add an optional `component_id` FK once `building_components` lands. |
 

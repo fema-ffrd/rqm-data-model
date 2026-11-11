@@ -1,6 +1,6 @@
 # Notebooks
 
-## `nsi_demo.ipynb`
+## `01_setup_demo.ipynb`
 
 End-to-end demo of the NSI-minimal workflow: boot Apache Sedona + Iceberg (Spark 4.1, Iceberg v3 tables with native geometry), ingest the NSI parquet into `rqm.inventory.buildings` and `rqm.inventory.geometries`, inspect the partition/sort layout, assert the ADR invariants, run a few analytical queries, and export a flat analysis-ready table (parquet + CSV, WGS84 lat/lon) for the structures inside a watershed polygon. The watershed is `test/data/watershed/trinity.shp` (HUC4 1203, Trinity River, TX); the export keeps only NSI points strictly inside it via a Sedona broadcast spatial join (`ST_Contains`). Point `WATERSHED_SHP` / `WATERSHED_CRS` in the setup cell at another shapefile to subset a different area.
 
@@ -8,7 +8,7 @@ Run inside the devcontainer (`rqm-base` env). The input is `$RQM_DATA_DIR/data/n
 
 Warehouses written before the move to the JDBC catalog and the `inventory` namespace are not visible to the notebook. Delete `warehouse-notebook/` to reload, or register the old tables (see the main README, "Configuring the Spark session").
 
-## `nsi_versioning_demo.ipynb`
+## `02_versioning_demo.ipynb`
 
 Walkthrough of inventory versioning ([ADR-versioning](../docs/decisions/ADR-versioning.md)) on the 45,622-structure sample `test/data/nsi.parquet`. It covers:
 
@@ -19,12 +19,24 @@ Walkthrough of inventory versioning ([ADR-versioning](../docs/decisions/ADR-vers
 - exports pinned to a version by a `_rqm_version.json` manifest, re-exported identically after the inventory has moved on;
 - `check_consistency` over every version.
 
-It runs in about a minute and a half. Everything is recreated on each run under `$RQM_DATA_DIR/versioning-notebook/` (`warehouse/`, `inputs/`, `exports/`), or under `test/versioning-notebook/` (gitignored) without `RQM_DATA_DIR`. The committed copy was executed with `jupyter nbconvert --to notebook --execute --inplace notebooks/nsi_versioning_demo.ipynb`.
+It runs in about a minute and a half. Everything is recreated on each run under `$RQM_DATA_DIR/versioning-notebook/` (`warehouse/`, `inputs/`, `exports/`), or under `test/versioning-notebook/` (gitignored) without `RQM_DATA_DIR`. The committed copy was executed with `jupyter nbconvert --to notebook --execute --inplace notebooks/02_versioning_demo.ipynb`.
 
-## Regenerating the notebook
+## `03_multi_source_demo.ipynb`
 
-The committed `.ipynb` is generated from `_build_demo_notebook.py` so cell edits stay diff-friendly. After editing the generator:
+Walkthrough of multi-source inventories ([ADR-multi-source](../docs/decisions/ADR-multi-source.md), RQM-04), using synthetic sources that `tools/synthetic_sources.py` derives from `test/data/nsi.parquet`. The sources are:
 
-```bash
-python notebooks/_build_demo_notebook.py
-```
+- a county assessor roll: GeoPackage parcel polygons in EPSG:2276 with land-use codes, first-floor elevation in inches, text foundation types, and `PARCEL_ID` ids;
+- a field survey: CSV with lon / lat and a sparse mapping;
+- a planned development: parquet with WKB points.
+
+Their mapping specs are in [`sources/`](sources/). The notebook covers:
+
+- validating the specs, including a rejected one;
+- loading NSI, the assessor, and the survey as versions `v1`–`v3`, then inspecting the `sources` registry and the version lineage;
+- querying one field schema across sources: occupancy mix, exposed value, footprints vs. points, maps, and why summing across sources double counts;
+- a scoped reload of the assessor's second release (`v4`) whose diff touches only assessor rows;
+- loading the project inventory on a `riverbend` branch and fast-forward merging it (`v5`);
+- a pinned export filtered to NSI + assessor, with its manifest;
+- `check_consistency` over every version.
+
+It runs in about a minute. Everything is recreated on each run under `$RQM_DATA_DIR/multi-source-notebook/` (`warehouse/`, `inputs/`, `exports/`), or under `test/multi-source-notebook/` (gitignored) without `RQM_DATA_DIR`. The committed copy was executed with `jupyter nbconvert --to notebook --execute --inplace notebooks/03_multi_source_demo.ipynb`.

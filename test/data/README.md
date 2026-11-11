@@ -22,5 +22,5 @@ Source: NSI public distribution (https://www.hec.usace.army.mil/confluence/nsi).
 ## `watershed/trinity.shp`
 
 USGS WBD HUC4 1203 (Trinity River, TX) watershed boundary: one polygon,
-NAD83 geographic (EPSG:4269). `notebooks/nsi_demo.ipynb` uses it to spatially
+NAD83 geographic (EPSG:4269). `notebooks/01_setup_demo.ipynb` uses it to spatially
 subset the analysis-ready export to the NSI points inside the watershed.

@@ -13,6 +13,7 @@ test/warehouse/
 test/warehouse-*/
 test/exports-*/
 test/versioning-notebook/
+test/multi-source-notebook/
 spark-warehouse/
 derby.log
 metastore_db/

@@ -21,12 +21,15 @@ The script:
    `--catalog-type hadoop` and REST/Glue catalogs also work).
 3. Applies the DDL in `tools/schema.sql` (idempotent CREATE NAMESPACE / CREATE
    TABLE IF NOT EXISTS; tables live in the `inventory` namespace) with the
-   partition spec and write order from `TableLayout`.
-4. Reads the NSI parquet, projects to the `buildings` column order, sets the
-   stable `building_id` to the NSI `fd_id`, and MERGEs it into
-   `rqm.inventory.buildings` as a full replacement: new structures are
-   inserted, changed ones updated (fresh `ingested_at`), unchanged ones left
-   alone, and missing ones deleted from the branch head.
+   partition spec and write order from `TableLayout`, and migrates existing
+   tables by adding missing columns (`migrate_table`).
+4. Reads the NSI parquet through the built-in source spec
+   `tools/sources/nsi.yaml` (the generic engine in `tools/ingest_source.py`),
+   sets the stable `building_id` to the NSI `fd_id`, registers the `NSI`
+   source, and MERGEs it into `rqm.inventory.buildings` as a full replacement
+   of the NSI rows: new structures are inserted, changed ones updated (fresh
+   `ingested_at`), unchanged ones left alone, and missing ones deleted from
+   the branch head. Rows of other sources (ADR-multi-source) are untouched.
 5. Derives `rqm.inventory.geometries` rows from the same source the same way:
    one row per structure with `role='point'`, `purpose='computation'`,
    `is_selected_for_export=true`, `geom` stored as a native Iceberg v3
@@ -66,6 +69,8 @@ SCHEMA_SQL = HERE / "schema.sql"
 # Order matches tools/schema.sql rqm.buildings.
 BUILDINGS_COLUMNS: list[str] = [
     "building_id",
+    "source_ref",
+    "source_record_id",
     "fd_id",
     "bid",
     "usastrucid",
@@ -163,8 +168,9 @@ NSI_SCALAR_FIELDS: list[str] = [
     "y",
 ]
 
-# Target types for the write; cast to these from the raw NSI parquet types
-# so Iceberg DDL matches exactly.
+# Target types of the mappable `buildings` columns (the NSI field set shared
+# by every source); every mapped value is cast to these so Iceberg DDL
+# matches exactly.
 BUILDINGS_CAST: dict[str, str] = {
     "fd_id": "bigint",
     "bid": "string",
@@ -602,6 +608,107 @@ def assert_no_geometry_id_collisions(
         )
 
 
+# `source_ref` of the National Structure Inventory. NSI rows keep
+# `building_id = fd_id`; every other source gets hashed ids
+# (`source_building_id_expr`).
+NSI_SOURCE_REF = "NSI"
+
+# Columns added to `buildings` by the multi-source migration. Rows written
+# before it read back NULL (Iceberg cannot add a required column and Spark
+# 4.1 has no column defaults) and tags taken before it lack the columns, so
+# readers fill them in with these SQL expressions (`conform_buildings`).
+# `{p}` is the table alias prefix (`"t."` or `""`).
+CONFORMED_BUILDING_COLUMNS: dict[str, str] = {
+    "source_ref": f"coalesce({{p}}source_ref, '{NSI_SOURCE_REF}')",
+    "source_record_id": "coalesce({p}source_record_id, CAST({p}fd_id AS STRING))",
+}
+_CONFORMED_MISSING: dict[str, str] = {
+    "source_ref": f"'{NSI_SOURCE_REF}'",
+    "source_record_id": "CAST({p}fd_id AS STRING)",
+}
+
+
+def conformed_sql(column: str, alias: str | None = None, present: bool = True) -> str:
+    """SQL reading `column` of a `buildings` row, with migrated NULLs filled in.
+
+    `alias` qualifies the column (`t` -> `t.source_ref`); `present=False`
+    gives the value for a table version that predates the column.
+    """
+    p = f"{alias}." if alias else ""
+    if column in CONFORMED_BUILDING_COLUMNS:
+        template = (CONFORMED_BUILDING_COLUMNS if present else _CONFORMED_MISSING)[
+            column
+        ]
+        return template.format(p=p)
+    return f"{p}{column}" if present else "NULL"
+
+
+def conform_buildings(df: DataFrame) -> DataFrame:
+    """`buildings` rows in the current column order, with migrated columns filled.
+
+    Rows and tags written before the multi-source migration have NULL (or no)
+    `source_ref` / `source_record_id`; they are NSI rows, so they read as
+    `NSI` / the `fd_id` string, and diffs across the migration show no
+    spurious changes.
+    """
+    present = set(df.columns)
+    exprs = []
+    for column in BUILDINGS_COLUMNS:
+        sql = conformed_sql(column, present=column in present)
+        if sql == column:
+            exprs.append(F.col(column))
+            continue
+        dtype = BUILDINGS_CAST.get(column, "string")
+        exprs.append(F.expr(sql).cast(dtype).alias(column))
+    return df.select(*exprs)
+
+
+def source_building_id_sql(source_ref_sql: str, source_record_id_sql: str) -> str:
+    """SQL for the `building_id` of a non-NSI row (see `source_building_id_expr`)."""
+    return (
+        f"(xxhash64({source_ref_sql}, {source_record_id_sql}) "
+        "| shiftleft(CAST(1 AS BIGINT), 63))"
+    )
+
+
+def source_building_id_expr(source_ref: Column, source_record_id: Column) -> Column:
+    """`building_id` of a non-NSI row: xxhash64(source_ref, source_record_id)
+    with the sign bit set.
+
+    The id is always negative, so it never collides with NSI's positive
+    `fd_id`s, and it depends only on the source lineage and the source's
+    native id, so it is stable across reloads and releases. Changing it
+    re-keys every non-NSI building.
+    """
+    sign_bit = F.shiftleft(F.lit(1).cast("bigint"), 63)
+    return F.xxhash64(source_ref, source_record_id).bitwiseOR(sign_bit)
+
+
+def assert_no_building_id_collisions(
+    new_rows: DataFrame, existing_rows: DataFrame
+) -> None:
+    """Raise if one hashed `building_id` maps to more than one
+    (source_ref, source_record_id) pair. Mirrors
+    `assert_no_geometry_id_collisions`.
+    """
+    cols = ["building_id", "source_ref", "source_record_id"]
+    collisions = (
+        new_rows.select(*cols)
+        .unionByName(existing_rows.select(*cols))
+        .distinct()
+        .groupBy("building_id")
+        .count()
+        .filter(F.col("count") > 1)
+        .limit(5)
+        .collect()
+    )
+    if collisions:
+        ids = [row["building_id"] for row in collisions]
+        raise ValueError(
+            f"building_id hash collision between different source records: {ids}"
+        )
+
+
 @dataclass(frozen=True)
 class TableLayout:
     """Physical layout applied when `apply_schema` creates a table.
@@ -683,6 +790,116 @@ def created_table(statement: str) -> str | None:
     return match.group(1) if match else None
 
 
+@dataclass(frozen=True)
+class ColumnDef:
+    """One column of a `CREATE TABLE` statement (see `table_columns`)."""
+
+    name: str
+    type_sql: str
+    not_null: bool
+    comment_sql: str | None  # the quoted literal, e.g. "'Stable PK.'"
+
+
+_COLUMN_DEF_RE = re.compile(
+    r"^(\w+)\s+(.+?)(\s+NOT\s+NULL)?(?:\s+COMMENT\s+('(?:[^'\\]|\\.|'')*'))?$",
+    re.IGNORECASE | re.DOTALL,
+)
+
+
+def _split_top_level(text: str, sep: str = ",") -> list[str]:
+    """Split on `sep` outside quotes, (), and <>."""
+    parts, buf, depth, quote = [], [], 0, ""
+    i = 0
+    while i < len(text):
+        ch = text[i]
+        if quote:
+            buf.append(ch)
+            if ch == "\\" and quote != "`" and i + 1 < len(text):
+                buf.append(text[i + 1])
+                i += 1
+            elif ch == quote:
+                quote = ""
+        elif ch in ("'", '"', "`"):
+            quote = ch
+            buf.append(ch)
+        elif ch in "(<":
+            depth += 1
+            buf.append(ch)
+        elif ch in ")>":
+            depth -= 1
+            buf.append(ch)
+        elif ch == sep and depth == 0:
+            parts.append("".join(buf).strip())
+            buf = []
+        else:
+            buf.append(ch)
+        i += 1
+    parts.append("".join(buf).strip())
+    return [p for p in parts if p]
+
+
+def table_columns(create_statement: str) -> list[ColumnDef]:
+    """Columns declared by a `CREATE TABLE IF NOT EXISTS` statement, in order."""
+    match = _CREATE_TABLE_RE.match(create_statement)
+    if match is None:
+        raise ValueError("table_columns expects a CREATE TABLE IF NOT EXISTS statement")
+    start = create_statement.index("(", match.end())
+    depth, quote, end = 0, "", None
+    for i in range(start, len(create_statement)):
+        ch = create_statement[i]
+        if quote:
+            if ch == quote:
+                quote = ""
+        elif ch in ("'", '"', "`"):
+            quote = ch
+        elif ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+            if depth == 0:
+                end = i
+                break
+    if end is None:
+        raise ValueError("unbalanced parentheses in CREATE TABLE statement")
+    columns = []
+    for part in _split_top_level(create_statement[start + 1 : end]):
+        col = _COLUMN_DEF_RE.match(part)
+        if col is None:
+            raise ValueError(f"cannot parse column definition: {part!r}")
+        name, type_sql, not_null, comment = col.groups()
+        columns.append(ColumnDef(name, type_sql.strip(), bool(not_null), comment))
+    return columns
+
+
+def migrate_table(spark: SparkSession, create_statement: str) -> list[str]:
+    """Add the columns of `create_statement` that the existing table lacks.
+
+    Each missing column is added in its DDL position (`AFTER` its
+    predecessor) with its comment. Iceberg cannot add a required column to a
+    populated table and Spark 4.1 does not support column defaults, so
+    added columns are nullable and existing rows read NULL (see
+    `conform_buildings`). Columns are never dropped or retyped. Returns the
+    added column names.
+    """
+    table = created_table(create_statement)
+    if table is None:
+        raise ValueError("migrate_table expects a CREATE TABLE IF NOT EXISTS statement")
+    existing = {c.lower() for c in spark.table(table).columns}
+    added: list[str] = []
+    previous: str | None = None
+    for col in table_columns(create_statement):
+        if col.name.lower() not in existing:
+            position = f"AFTER {previous}" if previous else "FIRST"
+            comment = f" COMMENT {col.comment_sql}" if col.comment_sql else ""
+            spark.sql(
+                f"ALTER TABLE {table} ADD COLUMN {col.name} {col.type_sql}"
+                f"{comment} {position}"
+            )
+            added.append(col.name)
+        previous = col.name
+    return added
+
+
 def layout_sql(create_statement: str, layout: TableLayout) -> list[str]:
     """Return the statements that create a table with `layout` applied."""
     table = created_table(create_statement)
@@ -707,7 +924,7 @@ def apply_schema(
     catalog: str,
     layouts: Mapping[str, TableLayout] = DEFAULT_LAYOUTS,
     namespace: str = NAMESPACE,
-) -> None:
+) -> dict[str, list[str]]:
     """Apply the CREATE NAMESPACE / CREATE TABLE statements from schema.sql.
 
     `layouts` maps unqualified table names to the partition spec and write
@@ -716,6 +933,12 @@ def apply_schema(
     existing tables are left untouched, so changing the layout of a populated
     table is an explicit Iceberg partition evolution (`ALTER TABLE ... ADD /
     DROP PARTITION FIELD`, `WRITE ORDERED BY`).
+
+    Existing tables are migrated idempotently: columns the DDL declares but
+    the table lacks are added (`migrate_table`). When `buildings` gains
+    `source_ref`, its existing rows are NSI rows, so the built-in NSI source
+    is registered in `sources` for them to resolve. Returns the added
+    columns per migrated table.
 
     Spark SQL accepts one statement per `spark.sql(...)` call, so the script
     is split with `split_sql_statements`.
@@ -730,6 +953,7 @@ def apply_schema(
     if unknown:
         raise ValueError(f"layouts given for tables not in schema.sql: {unknown}")
 
+    migrated: dict[str, list[str]] = {}
     for statement in statements:
         table = created_table(statement)
         if table is None:
@@ -738,6 +962,15 @@ def apply_schema(
             layout = layouts.get(table.split(".")[-1], TableLayout())
             for sql in layout_sql(statement, layout):
                 spark.sql(sql)
+        elif added := migrate_table(spark, statement):
+            migrated[table.split(".")[-1]] = added
+
+    if "source_ref" in migrated.get("buildings", []):
+        from ingest_source import register_source
+        from sources import nsi_spec
+
+        register_source(spark, nsi_spec(), catalog, namespace)
+    return migrated
 
 
 # Branch and version (tag) names are interpolated into SQL identifiers and
@@ -782,9 +1015,10 @@ def require_branch(
         )
 
 
-# NSI-derived geometries carry this source_ref prefix; a full NSI reload only
-# deletes geometries with it, so footprints from other sources survive.
-NSI_SOURCE_PREFIX = "NSI-"
+# Geometries derived by the NSI load carry this source_ref prefix
+# (`NSI-<source>`, e.g. NSI-P); a reload only deletes stale geometries in its
+# own source's scope, so footprints from other sources survive.
+NSI_SOURCE_PREFIX = f"{NSI_SOURCE_REF}-"
 
 # Columns that decide whether a re-loaded building changed. `ingested_at`
 # records when a row was last written, so it is not compared.
@@ -812,44 +1046,26 @@ def load_buildings(
     namespace: str = NAMESPACE,
     branch: str | None = None,
 ) -> int:
-    """Upsert an NSI parquet into `buildings` as a full replacement.
+    """Upsert an NSI parquet into `buildings` as a full replacement of NSI.
 
-    The parquet is the complete inventory for `branch` (default main): rows
-    match on `building_id` (= NSI `fd_id`); new ids are inserted, rows whose
-    values changed are updated with a fresh `ingested_at`, unchanged rows are
-    left alone, and buildings missing from the parquet are deleted from the
-    branch head. Tagged versions keep the deleted rows.
+    The parquet is the complete NSI inventory for `branch` (default main):
+    rows match on `building_id` (= NSI `fd_id`); new ids are inserted, rows
+    whose values changed are updated with a fresh `ingested_at`, unchanged
+    rows are left alone, and NSI buildings missing from the parquet are
+    deleted from the branch head. Buildings of other sources are never
+    touched. Tagged versions keep the deleted rows. Also registers the NSI
+    source in `sources`.
 
-    Returns the row count at the branch head.
+    Delegates to the generic engine (`ingest_source`) with the built-in spec
+    `tools/sources/nsi.yaml`. Returns the NSI row count at the branch head.
     """
-    require_branch(spark, catalog, branch, namespace)
-    raw = spark.read.parquet(str(parquet_path))
-    projected = raw.select(
-        *[F.col(c).cast(t).alias(c) for c, t in BUILDINGS_CAST.items()]
-    )
-    # NSI fd_id is unique per structure and stable across loads, so it is the
-    # identity; any future non-NSI source needs its own id scheme.
-    with_id = projected.withColumn("building_id", F.col("fd_id"))
-    with_ts = with_id.withColumn("ingested_at", F.current_timestamp())
-    buildings_df = with_ts.select(*BUILDINGS_COLUMNS)
-    assert_unique_key(buildings_df, "building_id", str(parquet_path))
+    from ingest_source import merge_buildings, register_source
+    from sources import nsi_spec
 
-    target = table_name(catalog, "buildings", namespace, branch)
-    buildings_df.createOrReplaceTempView("_rqm_load_buildings")
-    try:
-        spark.sql(
-            f"""
-            MERGE INTO {target} t
-            USING _rqm_load_buildings s
-            ON t.building_id = s.building_id
-            WHEN MATCHED AND ({changed_sql(BUILDING_COMPARE_COLUMNS)}) THEN UPDATE SET *
-            WHEN NOT MATCHED THEN INSERT *
-            WHEN NOT MATCHED BY SOURCE THEN DELETE
-            """
-        )
-    finally:
-        spark.catalog.dropTempView("_rqm_load_buildings")
-    return spark.table(target).count()
+    spec = nsi_spec()
+    require_branch(spark, catalog, branch, namespace)
+    register_source(spark, spec, catalog, namespace)
+    return merge_buildings(spark, spec, parquet_path, catalog, namespace, branch)
 
 
 def load_geometries(
@@ -859,81 +1075,28 @@ def load_geometries(
     namespace: str = NAMESPACE,
     branch: str | None = None,
 ) -> int:
-    """Upsert the NSI 'point' geometry of every building on `branch`.
+    """Upsert the NSI 'point' geometry of every NSI building on `branch`.
 
     One row per NSI structure, `building_id` = `fd_id`, kept only for
     buildings present on the branch (logical FK). `geometry_id` is the stable
     hash from `geometry_id_expr()`; the write is refused if it collides with
     a different natural key. Existing rows are updated only when the point or
     CRS changed, and `is_selected_for_export` is never overwritten, so a
-    selection migration survives a reload. NSI points missing from the
-    parquet are deleted, and so are geometries from any source whose building
-    is gone. `geom` is a native GEOMETRY(3857); query it with Sedona via
-    `sedona_geom_sql()` (`ST_GeomFromWKB(spark_st_asbinary(geom))`).
+    selection migration survives a reload. NSI points of NSI buildings that
+    are missing from the parquet are deleted, and so are geometries from any
+    source whose building is gone. `geom` is a native GEOMETRY(3857); query
+    it with Sedona via `sedona_geom_sql()`
+    (`ST_GeomFromWKB(spark_st_asbinary(geom))`).
 
-    Run after `load_buildings` for the same parquet and branch. Returns the
-    row count at the branch head.
+    Run after `load_buildings` for the same parquet and branch. Delegates to
+    `ingest_source.merge_geometries` with the built-in NSI spec. Returns the
+    count of NSI-derived geometries at the branch head.
     """
+    from ingest_source import merge_geometries
+    from sources import nsi_spec
+
     require_branch(spark, catalog, branch, namespace)
-    raw = spark.read.parquet(str(parquet_path)).select(
-        F.col("fd_id").cast("bigint").alias("building_id"),
-        F.col("source").cast("string").alias("source"),
-        F.col("shape").alias("wkb_raw"),
-    )
-    buildings_table = table_name(catalog, "buildings", namespace, branch)
-    buildings = spark.table(buildings_table).select("building_id")
-    joined = raw.join(buildings, on="building_id", how="left_semi")
-
-    geoms = joined.select(
-        F.col("building_id"),
-        F.lit("point").alias("role"),
-        F.lit("computation").alias("purpose"),
-        F.lit(True).alias("is_selected_for_export"),
-        F.lit(None).cast("string").alias("alt_group_key"),
-        F.concat(
-            F.lit(NSI_SOURCE_PREFIX), F.coalesce(F.col("source"), F.lit("unknown"))
-        ).alias("source_ref"),
-        F.lit(f"EPSG:{GEOM_SRID}").alias("crs"),
-        F.expr(native_geom_sql("CAST(wkb_raw AS BINARY)")).alias("geom"),
-        F.current_timestamp().alias("ingested_at"),
-    )
-    target = table_name(catalog, "geometries", namespace, branch)
-    geoms = geoms.select(geometry_id_expr().alias("geometry_id"), *geoms.columns)
-
-    assert_no_geometry_id_collisions(geoms, spark.table(target))
-    geoms.createOrReplaceTempView("_rqm_load_geometries")
-    try:
-        spark.sql(
-            f"""
-            MERGE INTO {target} t
-            USING _rqm_load_geometries s
-            ON t.geometry_id = s.geometry_id
-            WHEN MATCHED AND (
-                NOT (spark_st_asbinary(t.geom) <=> spark_st_asbinary(s.geom))
-                OR NOT (t.crs <=> s.crs)
-            ) THEN UPDATE SET geom = s.geom, crs = s.crs, ingested_at = s.ingested_at
-            WHEN NOT MATCHED THEN INSERT *
-            WHEN NOT MATCHED BY SOURCE AND t.source_ref LIKE '{NSI_SOURCE_PREFIX}%'
-                THEN DELETE
-            """
-        )
-    finally:
-        spark.catalog.dropTempView("_rqm_load_geometries")
-
-    # Non-NSI geometries (e.g. footprints) of buildings the load removed.
-    orphans = f"""
-        SELECT g.geometry_id FROM {target} g
-        LEFT ANTI JOIN {buildings_table} b ON g.building_id = b.building_id
-    """
-    if spark.sql(orphans).limit(1).count():
-        spark.sql(
-            f"""
-            MERGE INTO {target} t USING ({orphans}) s
-            ON t.geometry_id = s.geometry_id
-            WHEN MATCHED THEN DELETE
-            """
-        )
-    return spark.table(target).count()
+    return merge_geometries(spark, nsi_spec(), parquet_path, catalog, namespace, branch)
 
 
 def geoparquet_covering_columns(schema: pa.Schema) -> set[str]:
@@ -1163,6 +1326,7 @@ def main() -> int:
             f"from {parquet_rows} parquet rows into branch {branch!r} "
             f"of the Iceberg warehouse at {args.warehouse}."
         )
+        # Both counts cover NSI rows only, so other loaded sources don't count.
         if n_buildings != parquet_rows or n_geoms != parquet_rows:
             print("warning: row-count mismatch; smoke tests will fail", file=sys.stderr)
             return 1
@@ -1178,6 +1342,7 @@ def main() -> int:
                 branch=branch,
                 kind=args.kind,
                 parent=args.parent,
+                source_ref=NSI_SOURCE_REF,
                 source_uri=str(args.parquet.resolve()),
                 source_sha256=file_sha256(args.parquet),
                 namespace=ns,

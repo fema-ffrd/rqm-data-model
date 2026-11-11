@@ -1,0 +1,21 @@
+# Demo source spec: a project inventory of planned structures (synthetic;
+# tools/synthetic_sources.py). Parquet with WKB points already in EPSG:3857.
+source_ref: PROJECT-RIVERBEND
+source_name: Riverbend Planned Development
+source_kind: project_inventory
+description: >
+  Synthetic planned subdivision (homes, townhomes, retail pads) evaluated
+  on a project branch before it is merged into main.
+input:
+  format: parquet
+  crs: EPSG:3857
+  geometry: {kind: point, column: geometry}
+id: {column: LOT_NO}
+fields:
+  occtype: {from: USE, map: {SFR: RES1, TH: RES3A, RETAIL: COM1}}
+  st_damcat: {from: USE, map: {SFR: RES, TH: RES, RETAIL: COM}}
+  val_struct: PLANNED_VALUE
+  found_ht: FIN_FLOOR_FT
+  found_type: FOUND
+  num_story: STORIES
+  cbfips: BLOCK_GEOID

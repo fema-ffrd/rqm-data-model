@@ -16,7 +16,7 @@ SRC = HERE / "data-dictionary.yaml"
 OUT = HERE / "data-dictionary.md"
 
 DOMAIN_TITLES = {
-    "inventory": "A — Inventory (NSI structures + first-class geometry)",
+    "inventory": "A — Inventory (multi-source structures + first-class geometry)",
 }
 
 TIER_BADGE = {
@@ -75,7 +75,9 @@ def render(model):
         "realizations, export contracts, provenance registry, and valid-time "
         "(bitemporal) history are deferred; re-entry points are documented in "
         "ADR-nsi-minimal. Inventory versions, branches, and the per-building "
-        "change log follow ADR-versioning. The previous full-coverage "
+        "change log follow ADR-versioning. Other building inventories load "
+        "side by side with NSI, scoped by `source_ref` and registered in "
+        "`sources`, per ADR-multi-source. The previous full-coverage "
         "dictionary is preserved at `data-dictionary-full.yaml`.\n"
     )
 

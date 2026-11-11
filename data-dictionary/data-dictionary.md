@@ -1,14 +1,15 @@
 # Risk Quantification Methodology (RQM) Data Model — NSI Minimal — Data Dictionary
 
-**Version:** 0.3.0 &nbsp;|&nbsp; **Companion:** `fema-ffrd/inland-consequences` &nbsp;|&nbsp; **Query engine:** Apache Sedona (Spark 4.1)
+**Version:** 0.4.0 &nbsp;|&nbsp; **Companion:** `fema-ffrd/inland-consequences` &nbsp;|&nbsp; **Query engine:** Apache Sedona (Spark 4.1)
 
-NSI-minimal edition: a focused, loadable schema for a single National Structure Inventory parquet ingest, with first-class multiple-geometry support (ADR-geometry) preserved so additional footprint sources can be attached beside each NSI point without a schema break. Component decomposition, attribute uncertainty, hazard links, DDFs, loss realizations, export contracts, provenance registry, and valid-time (bitemporal) history are deferred; re-entry points are documented in ADR-nsi-minimal. Inventory versions, branches, and the per-building change log follow ADR-versioning. The previous full-coverage dictionary is preserved at `data-dictionary-full.yaml`.
+NSI-minimal edition: a focused, loadable schema for a single National Structure Inventory parquet ingest, with first-class multiple-geometry support (ADR-geometry) preserved so additional footprint sources can be attached beside each NSI point without a schema break. Component decomposition, attribute uncertainty, hazard links, DDFs, loss realizations, export contracts, provenance registry, and valid-time (bitemporal) history are deferred; re-entry points are documented in ADR-nsi-minimal. Inventory versions, branches, and the per-building change log follow ADR-versioning. Other building inventories load side by side with NSI, scoped by `source_ref` and registered in `sources`, per ADR-multi-source. The previous full-coverage dictionary is preserved at `data-dictionary-full.yaml`.
 
 ## Contents
 
-- **Domain A — Inventory (NSI structures + first-class geometry)**
+- **Domain A — Inventory (multi-source structures + first-class geometry)**
   - [`buildings`](#buildings)
   - [`geometries`](#geometries)
+  - [`sources`](#sources)
   - [`inventory_versions`](#inventory_versions)
   - [`inventory_changes`](#inventory_changes)
 
@@ -21,18 +22,21 @@ NSI-minimal edition: a focused, loadable schema for a single National Structure 
 - **`geometry_purpose`**: `computation`, `hazard_sampling`, `display`, `qc`
 - **`version_kind`**: `release`, `edit`, `merge`
 - **`change_kind`**: `added`, `removed`, `modified`
+- **`source_kind`**: `national_inventory`, `local_inventory`, `commercial_inventory`, `project_inventory`, `field_survey`, `remote_sensing`, `other`
 
-## Domain A — Inventory (NSI structures + first-class geometry)
+## Domain A — Inventory (multi-source structures + first-class geometry)
 
 ### `buildings`
-**Storage:** Iceberg (via Apache Sedona) &nbsp;|&nbsp; **Grain:** One row per NSI structure.
+**Storage:** Iceberg (via Apache Sedona) &nbsp;|&nbsp; **Grain:** One row per structure per source inventory.
 
-Flat NSI inventory projection. Every NSI parquet column maps 1:1 to a column on this table, using NSI's native field names (occtype, num_story, val_struct, pop2amu65, …) so queries line up with the raw source. Geometry lives in the `geometries` table (ADR-geometry preserved). Component decomposition, attribute uncertainty specs, hazard links, DDFs, loss realizations, export contracts, provenance registry, and valid-time (bitemporal) history are deferred; re-entry points are documented in ADR-nsi-minimal. The primary key `building_id` is set to the NSI `fd_id` at ingest so ids are stable across re-ingests and versions; `fd_id` is kept as the external natural key. Loads MERGE a full replacement into a branch; earlier states stay readable through version tags (ADR-versioning). Physical layout: partitioned by state (Iceberg `truncate(2, cbfips)`) and sorted by `cbfips`; merge-on-read writes.
+Flat inventory projection on the NSI field set. Every NSI parquet column maps 1:1 to a column on this table, using NSI's native field names (occtype, num_story, val_struct, pop2amu65, …) so queries line up with the raw source. Other inventories map onto the same columns through a YAML source spec (ADR-multi-source); their unmapped fields are NULL. Sources sit side by side, scoped by source_ref, so one physical structure can appear once per source — aggregates across sources double count. Geometry lives in the `geometries` table (ADR-geometry preserved). Component decomposition, attribute uncertainty specs, hazard links, DDFs, loss realizations, export contracts, provenance registry, and valid-time (bitemporal) history are deferred; re-entry points are documented in ADR-nsi-minimal. The primary key `building_id` is the NSI `fd_id` for NSI rows and a hash of (source_ref, source_record_id) for every other source, so ids are stable across re-ingests and versions. Loads MERGE a full replacement of one source into a branch; other sources are untouched, and earlier states stay readable through version tags (ADR-versioning). Physical layout: partitioned by state (Iceberg `truncate(2, cbfips)`) and sorted by `cbfips`; merge-on-read writes.
 
 | Column | Type | Key | Null | Description |
 |---|---|---|---|---|
-| `building_id` | bigint | PK | NOT NULL | Stable primary key; equals the NSI fd_id (logical identity; unique, asserted in smoke tests). |
-| `fd_id` | bigint |  |  | NSI structure id (external natural key; source of building_id; logically UNIQUE where not null). |
+| `building_id` | bigint | PK | NOT NULL | Stable primary key (unique, asserted in smoke tests). NSI rows: the fd_id. Other sources: xxhash64(source_ref, source_record_id) with the sign bit set, so always negative and never equal to an NSI id. |
+| `source_ref` | varchar(64) | FK → `sources.source_ref` | NOT NULL | Inventory the row came from (NSI, COUNTY-ASSESSOR, ...). Loads replace only their own source's rows. Rows written before the multi-source migration read as NSI. |
+| `source_record_id` | varchar(128) |  |  | Native id of the structure in its source (RQM-04), as a string; NSI: the fd_id. Unique per source_ref. |
+| `fd_id` | bigint |  |  | NSI structure id (external natural key; source of building_id for NSI rows; NULL for other sources unless they map it; logically UNIQUE where not null). |
 | `bid` | varchar(32) |  |  | NSI building id (UBID — Open Location Code plus extents, e.g. 8645XMJC+QG9-2-2-3-1). |
 | `usastrucid` | varchar(32) |  |  | FEMA USA Structures id (joins to USAS footprint source). |
 | `ftprntid` | varchar(64) |  |  | Footprint id as reported by NSI (joins to geometries.source_ref when the footprint source is attached). |
@@ -75,14 +79,14 @@ Flat NSI inventory projection. Every NSI parquet column maps 1:1 to a column on 
 | `creprcnt` | real |  |  | NSI community-resilience percent indicator. |
 | `crerank` | real |  |  | NSI community-resilience rank (fractional, 0-1). |
 | `cbfips` | varchar(15) |  |  | Census block GEOID (15-digit FIPS) for community-level aggregation. |
-| `x` | double |  |  | NSI structure X coordinate (EPSG:3857). Denormalized from `shape` for query convenience. |
-| `y` | double |  |  | NSI structure Y coordinate (EPSG:3857). Denormalized from `shape` for query convenience. |
+| `x` | double |  |  | Longitude (WGS84) of the structure point, as NSI publishes it; derived from the computation point for sources that do not map it. Denormalized for query convenience. |
+| `y` | double |  |  | Latitude (WGS84) of the structure point, as NSI publishes it; derived from the computation point for sources that do not map it. Denormalized for query convenience. |
 | `ingested_at` | timestamp |  | NOT NULL | When this row was last written: its insert, or the last load or edit that changed it. Version history lives in Iceberg snapshots + inventory_versions. |
 
 ### `geometries`
 **Storage:** Iceberg (via Apache Sedona) &nbsp;|&nbsp; **Grain:** One row per (building, representation, alternate) geometric record.
 
-First-class geometry registry (ADR-geometry preserved). Each row holds one geometric representation of a building. The NSI load produces exactly one row per structure with role='point', purpose='computation', is_selected_for_export=true, geom from the parquet `shape` column stored as a native Iceberg v3 GEOMETRY with a column-level CRS of EPSG:3857. Alternate footprints (MSBF, USAS) land as additional rows with role='footprint' and may flip the selected flag via a separate selection migration. Logical invariant: exactly one row per (building_id, purpose='computation') has is_selected_for_export=true at any time — enforced by the ingest script and smoke tests (Iceberg does not enforce UNIQUE). 3D roles, component-level geometry, and valid-time history are deferred (see ADR-nsi-minimal re-entry map). Versioned together with buildings (same tag per version). A reload never overwrites is_selected_for_export, deletes only missing NSI rows, and deletes rows from any source whose building is gone. Physical layout: unpartitioned by default (configurable via TableLayout in tools/ingest_nsi.py); merge-on-read writes.
+First-class geometry registry (ADR-geometry preserved). Each row holds one geometric representation of a building. Every load produces exactly one row per structure with role='point', purpose='computation', is_selected_for_export=true (NSI: geom from the parquet `shape` column), stored as a native Iceberg v3 GEOMETRY with a column-level CRS of EPSG:3857; input in other CRSs is transformed. Polygon sources add a role='footprint', purpose='display' row, and their computation point is ST_PointOnSurface of the footprint (ADR-multi-source). Alternate footprints (MSBF, USAS) land as additional rows with role='footprint' and may flip the selected flag via a separate selection migration. Logical invariant: exactly one row per (building_id, purpose='computation') has is_selected_for_export=true at any time — enforced by the ingest script and smoke tests (Iceberg does not enforce UNIQUE). 3D roles, component-level geometry, and valid-time history are deferred (see ADR-nsi-minimal re-entry map). Versioned together with buildings (same tag per version). A reload never overwrites is_selected_for_export, deletes only its own source's missing rows, and deletes rows from any source whose building is gone. Physical layout: unpartitioned by default (configurable via TableLayout in tools/ingest_nsi.py); merge-on-read writes.
 
 | Column | Type | Key | Null | Description |
 |---|---|---|---|---|
@@ -92,10 +96,24 @@ First-class geometry registry (ADR-geometry preserved). Each row holds one geome
 | `purpose` | varchar(16) |  | NOT NULL | Why this representation exists (enum geometry_purpose): computation | hazard_sampling | display | qc. |
 | `is_selected_for_export` | boolean |  | NOT NULL | Exactly one TRUE per (building_id |
 | `alt_group_key` | varchar(64) |  |  | Groups competing alternates at the same (building_id |
-| `source_ref` | varchar(64) |  |  | Source dataset identifier (e.g., NSI-2024.1, MSBF-2022-10, USAS-2024). |
+| `source_ref` | varchar(64) |  |  | Source dataset that derived the geometry: the building's sources.source_ref, or <source_ref>-<subcode> (NSI-P, NSI-H). Part of the geometry_id natural key. |
 | `crs` | varchar(16) |  | NOT NULL | EPSG string for this row's geometry; must equal the geom column CRS (EPSG:3857), so alternates are reprojected on load. |
 | `geom` | geometry |  | NOT NULL | Native Iceberg v3 GEOMETRY(EPSG:3857); Point for role='point', Polygon/MultiPolygon for role='footprint'. Sedona reads it via ST_GeomFromWKB(spark_st_asbinary(geom)). |
 | `ingested_at` | timestamp |  | NOT NULL | When this row was last written (insert, or a load that changed its point or CRS). |
+
+### `sources`
+**Storage:** Iceberg (via Apache Sedona) &nbsp;|&nbsp; **Grain:** One row per source inventory (dataset lineage).
+
+Registry of the inventories loaded into buildings (ADR-multi-source). A source_ref names a dataset lineage (NSI, COUNTY-ASSESSOR, ...) that stays the same across its releases; releases are told apart by version name and inventory_versions.source_uri. Upserted from the source's YAML mapping spec on every load, on main only (not versioned or branched), and never deleted, so every version's buildings.source_ref values resolve. The built-in NSI source is registered by the first NSI load (or by the schema migration of a pre-existing warehouse).
+
+| Column | Type | Key | Null | Description |
+|---|---|---|---|---|
+| `source_ref` | varchar(64) | PK | NOT NULL | Source identifier; upper-case letters, digits, ".", "_", "-" (starts with a letter or digit). NSI is reserved for the built-in National Structure Inventory spec. |
+| `source_name` | varchar(200) |  | NOT NULL | Human-readable name. |
+| `source_kind` | varchar(32) |  | NOT NULL | Enum source_kind: national_inventory, local_inventory, commercial_inventory, project_inventory, field_survey, remote_sensing, or other. |
+| `description` | text |  |  | Free text. |
+| `spec_sha256` | varchar(64) |  |  | SHA-256 of the YAML mapping spec last used to load the source. |
+| `updated_at` | timestamp |  | NOT NULL | When the row was last written. |
 
 ### `inventory_versions`
 **Storage:** Iceberg (via Apache Sedona) &nbsp;|&nbsp; **Grain:** One row per named inventory version.
@@ -109,6 +127,7 @@ Version registry (ADR-versioning). Each row names an immutable state of the inve
 | `merged_version` | varchar(100) | FK → `inventory_versions.version_name` |  | For kind=merge: the branch version merged in. |
 | `branch` | varchar(100) |  | NOT NULL | Iceberg branch the version was committed on (main or a project branch). |
 | `kind` | varchar(16) |  | NOT NULL | Enum version_kind: release, edit, or merge. |
+| `source_ref` | varchar(64) | FK → `sources.source_ref` |  | Source a release loaded (ADR-multi-source); NULL for edits, merges, and versions committed before multi-source support. |
 | `source_uri` | text |  |  | Input file loaded for the version (NULL for in-place edits and merges). |
 | `source_sha256` | varchar(64) |  |  | SHA-256 of the input file. |
 | `editor` | varchar(100) |  | NOT NULL | Who committed the version (RQM-16). |
