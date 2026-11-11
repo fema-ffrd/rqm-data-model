@@ -1,385 +1,310 @@
 # =============================================================================
-# Risk Quantification Methodology (RQM) Data Model — Data Dictionary
+# Risk Quantification Methodology (RQM) Data Model — NSI-Minimal Edition
 # -----------------------------------------------------------------------------
-# Re-architects deterministic building-loss inputs (flood depth, foundation
-# type, first-floor height, depth-damage function) into first-class,
-# versioned DISTRIBUTION objects for probabilistic risk assessment.
+# A focused, loadable schema for a single National Structure Inventory (NSI)
+# parquet ingest, with first-class multiple-geometry support (ADR-geometry)
+# preserved so that additional footprint sources (Microsoft Building
+# Footprints, FEMA USA Structures) can be attached beside each NSI point
+# without a schema break.
 #
-# Goals: (1) inventory/component coverage, (2) uncertainty quantification,
-#        (3) versioning / provenance.
+# Supersedes the hybrid data model's inventory / uncertainty / hazard / DDF /
+# realization / exports / provenance / versioning surface for v0.1. Re-entry
+# points for the deferred domains are documented in ADR-nsi-minimal.
 #
-# Storage tiers:
-#   postgres  -> relational integrity: inventory, distribution specs, results, provenance
-#   iceberg   -> ensemble-scale realization draws & aggregates (schema evolution, time-travel)
-#   icechunk  -> n-dimensional gridded hazard fields (Zarr; Git-like versioning)
+# The previous full-coverage dictionary is preserved at data-dictionary-full.yaml
+# for reference; diff against that file to see exactly what was deferred.
+#
+# Storage tier:
+#   iceberg -> relational, versioned Iceberg (format-version 3) tables accessed
+#              via Apache Sedona (Spark 4.1) for SQL, geometry (ST_*), and
+#              batch ingest. Geometry columns use the native Iceberg v3
+#              GEOMETRY type. All tables live in the `inventory` namespace
+#              (rqm.inventory.<table>).
+#
+# Versioning (ADR-versioning): named inventory versions are Iceberg tags on
+# buildings + geometries, registered in inventory_versions, with per-building
+# changes in inventory_changes. Project inventories are Iceberg branches.
+#
+# Multiple sources (ADR-multi-source): NSI and other inventories (assessor
+# rolls, field surveys, project inventories, ...) sit side by side in
+# buildings, scoped by source_ref and registered in sources. The NSI field
+# set is the shared column schema; each source maps onto it with a YAML spec.
 # =============================================================================
 
 metadata:
-  model_name: Risk Quantification Methodology (RQM) Data Model
-  version: 0.1.0
-  companion_repo: fema-ffrd/inland-consequences (SPHERE core schemas)
-  storage_tiers: [postgres, iceberg, icechunk]
-  domains: [inventory, attribute_uncertainty, hazard_linkage, ddf, realization_results, provenance]
+  model_name: Risk Quantification Methodology (RQM) Data Model — NSI Minimal
+  version: 0.4.0
+  companion_repo: fema-ffrd/inland-consequences
+  storage_tiers: [iceberg]
+  query_engine: Apache Sedona (Spark 4.1)
+  domains: [inventory]
 
 # -----------------------------------------------------------------------------
 # ENUMERATIONS
+# Inlined as varchar + CHECK/enum declaration. NSI already publishes stable
+# short codes; no lookup table buys anything until per-code metadata (RSMeans
+# rates, fragility curves) is needed — and adding a lookup is additive, not a
+# schema break.
 # -----------------------------------------------------------------------------
 enums:
-  dist_family:
-    - categorical          # PMF over discrete classes (e.g. foundation_type)
-    - bernoulli
-    - empirical            # sampled from an empirical CDF / value set
-    - normal
-    - truncated_normal
-    - lognormal
-    - uniform
-    - triangular
-    - deterministic        # degenerate distribution (back-compat / pinned value)
-  foundation_class:
-    - Slab
-    - CrawlSpace
-    - Basement
-    - Pier
-    - Pile
-    - SolidWall
-    - FillOrElevated
-  peril_type:
-    - riverine
-    - coastal
-    - compound
-  ddf_kind:
-    - building             # bddf_id
-    - content              # cddf_id
-    - inventory            # iddf_id
-  run_status:
-    - queued
-    - running
-    - success
-    - failed
-    - superseded
-  shuffle_policy:
-    - independent          # each building drawn independently
-    - region_correlated    # draws correlated within a region/community
-    - inventory_locked     # foundation fixed per inventory snapshot
-  component_type:
-    - finish
-    - foundation
-    - structure
-    - contents
-    - inventory
-  agg_level:
-    - building
-    - census_block
-    - community
-  run_type:
-    - loss
-    - sensitivity
-    - calibration
-  entity_type:
-    - buildings
-    - attribute_distributions
-    - foundation_pmf
-    - ddf_library
-    - events
+  occtype:
+    # HAZUS occupancy classes used by NSI; not exhaustive but covers v0.1.
+    - RES1          # Single-family
+    - RES2          # Mobile home
+    - RES3A         # Multi-family 2 units
+    - RES3B         # Multi-family 3-4 units
+    - RES3C         # Multi-family 5-9 units
+    - RES3D         # Multi-family 10-19 units
+    - RES3E         # Multi-family 20-49 units
+    - RES3F         # Multi-family 50+ units
+    - RES4          # Hotel / motel
+    - RES5          # Institutional dorm
+    - RES6          # Nursing home
+    - COM1          # Retail trade
+    - COM2          # Wholesale trade
+    - COM3          # Personal / repair services
+    - COM4          # Professional offices
+    - COM5          # Bank
+    - COM6          # Hospital
+    - COM7          # Medical office / clinic
+    - COM8          # Entertainment / recreation
+    - COM9          # Theater
+    - COM10         # Parking garage
+    - IND1          # Heavy industrial
+    - IND2          # Light industrial
+    - IND3          # Food / drugs / chemicals
+    - IND4          # Metals / mineral processing
+    - IND5          # High technology
+    - IND6          # Construction
+    - AGR1          # Agriculture
+    - GOV1          # General services
+    - GOV2          # Emergency response
+    - EDU1          # Schools
+    - EDU2          # Colleges / universities
+    - REL1          # Churches / non-profit
+  st_damcat:
+    - RES           # Residential
+    - COM           # Commercial
+    - IND           # Industrial
+    - PUB           # Public
+    - AGR           # Agricultural
+  found_type:
+    - S             # Slab on grade
+    - C             # Crawlspace
+    - B             # Basement
+    - P             # Pier / post
+    - F             # Fill / elevated
+  geometry_role:
+    - point
+    - footprint
+  geometry_purpose:
+    - computation
+    - hazard_sampling
+    - display
+    - qc
+  version_kind:
+    - release       # a new source dataset loaded in full
+    - edit          # in-place edits, or a revised copy of the dataset
+    - merge         # a branch merged into another branch
+  change_kind:
+    - added
+    - removed
+    - modified
+  source_kind:
+    # Kinds of building inventory (RQM-04: national, local, commercial, or
+    # project-specific); enum of sources.source_kind.
+    - national_inventory    # e.g. NSI
+    - local_inventory       # county assessor, municipal building inventory
+    - commercial_inventory  # vendor building / parcel datasets
+    - project_inventory     # planned or study-specific structures
+    - field_survey          # structures measured in the field
+    - remote_sensing        # footprints or attributes derived from imagery / lidar
+    - other
 
 # -----------------------------------------------------------------------------
-# DOMAIN A — INVENTORY  (coverage of building inventory / components)
+# DOMAIN A — INVENTORY  (NSI structures + first-class geometry)
 # -----------------------------------------------------------------------------
 tables:
 
   buildings:
     domain: inventory
-    storage: postgres
-    grain: One row per structure.
-    description: >
-      Anchor structure inventory, sourced from NSI / HAZUS. Holds identity,
-      geometry, and immutable/base attributes. Probabilistic attributes are NOT
-      stored here — they live in attribute_distributions and are resolved per
-      realization. Field aliases align to SPHERE core buildings schema.
-    columns:
-      - {name: building_id,        type: bigint,          pk: true,  nullable: false, description: Surrogate primary key.}
-      - {name: fd_id,              type: bigint,          nullable: true,  description: Source NSI/HAZUS structure id (alias id/bldg_id/fd_id).}
-      - {name: geom,               type: geometry(Point,5070), nullable: false, description: Structure point location (CONUS Albers, EPSG:5070).}
-      - {name: occupancy_type,     type: varchar(16),     nullable: false, description: Occupancy/occtype (e.g. RES1, COM1).}
-      - {name: general_building_type, type: varchar(32),  nullable: true,  description: General construction class (bldgtype).}
-      - {name: number_stories,     type: smallint,        nullable: true,  description: Story count (num_story).}
-      - {name: area_sqft,          type: double,          nullable: true,  description: Footprint/floor area, square feet (sqft).}
-      - {name: building_cost,      type: double,          nullable: true,  description: Structure replacement cost, USD (val_struct).}
-      - {name: content_cost,       type: double,          nullable: true,  description: Contents replacement cost, USD (val_cont).}
-      - {name: inventory_cost,     type: double,          nullable: true,  description: Business inventory cost, USD (val_inv).}
-      - {name: census_block,       type: varchar(15),     nullable: true,  description: Census block GEOID for community aggregation.}
-      - {name: inventory_version_id, type: bigint,        fk: versioning.version_id, nullable: false, description: Snapshot/version of the inventory this row belongs to.}
-      - {name: created_at,         type: timestamptz,     nullable: false, description: Row insertion timestamp.}
-
-  building_components:
-    domain: inventory
-    storage: postgres
-    grain: One row per damageable sub-assembly of a building.
-    description: >
-      Decomposes a structure into modular, shareable components (finish,
-      foundation, structure, contents, inventory) so component-/fragility-level
-      loss can be added without a schema break. Realizes the roadmap
-      "Components" concept (modular, improvable, reproducible).
-    columns:
-      - {name: component_id,   type: bigint,      pk: true,  nullable: false, description: Surrogate primary key.}
-      - {name: building_id,    type: bigint,      fk: buildings.building_id, nullable: false, description: Parent structure.}
-      - {name: component_type, type: varchar(24), nullable: false, description: 'One of finish|foundation|structure|contents|inventory (enum component_type).'}
-      - {name: generic_id,     type: bigint,      fk: generics.generic_id, nullable: false, description: Controlled-vocabulary inventory/component type.}
-      - {name: replacement_cost, type: double,    nullable: true,  description: Component replacement value, USD (for component-level loss).}
-      - {name: notes,          type: text,        nullable: true,  description: Free-text provenance / assumptions.}
-
-  generics:
-    domain: inventory
-    storage: postgres
-    grain: One row per controlled-vocabulary asset/component type.
-    description: >
-      Extensible "Generics" standard. Lets the same core model host non-building
-      inventories (transportation, utilities) in the future without redesign.
-    columns:
-      - {name: generic_id,   type: bigint,      pk: true, nullable: false, description: Surrogate primary key.}
-      - {name: category,     type: varchar(32), nullable: false, description: Top-level class (Buildings, Transportation, Utilities...).}
-      - {name: subtype,      type: varchar(64), nullable: false, description: Specific type within the category.}
-      - {name: schema_ref,   type: varchar(128),nullable: true,  description: Pointer to the type-specific attribute schema.}
-
-# -----------------------------------------------------------------------------
-# DOMAIN B — ATTRIBUTE UNCERTAINTY  (uncertainty quantification, core paradigm)
-# -----------------------------------------------------------------------------
-  attribute_distributions:
-    domain: attribute_uncertainty
-    storage: postgres
-    grain: One row per (building/component, attribute, version).
-    description: >
-      The heart of the probabilistic model. Replaces a scalar attribute value
-      with a typed, versioned distribution SPECIFICATION. Covers probabilistic
-      first-floor height, the "shuffled" foundation type, and any other
-      uncertain building attribute. Sampling engine reads these rows to draw
-      per-realization values.
-    columns:
-      - {name: dist_id,        type: bigint,       pk: true,  nullable: false, description: Surrogate primary key.}
-      - {name: building_id,    type: bigint,       fk: buildings.building_id, nullable: false, description: Structure the distribution applies to.}
-      - {name: component_id,   type: bigint,       fk: building_components.component_id, nullable: true, description: Optional component scope (null = whole building).}
-      - {name: attribute_name, type: varchar(48),  nullable: false, description: Attribute described, e.g. foundation_type, first_floor_height.}
-      - {name: dist_family,    type: varchar(24),  nullable: false, description: Distribution family (enum dist_family).}
-      - {name: parameters,     type: jsonb,        nullable: false, description: 'Family params, e.g. {"mu":1.5,"sigma":0.4,"lower":0} or PMF {"Slab":0.6,"Crawl":0.3}.'}
-      - {name: conditioning,   type: jsonb,        nullable: true,  description: 'Dependencies, e.g. FFH conditioned on sampled foundation_class.'}
-      - {name: units,          type: varchar(16),  nullable: true,  description: Physical units of the sampled quantity (ft, m, class).}
-      - {name: source,         type: varchar(128), nullable: true,  description: Data source / method used to fit the distribution.}
-      - {name: confidence,     type: real,         nullable: true,  description: "Analyst/model confidence score in [0,1]."}
-      - {name: version_id,     type: bigint,       fk: versioning.version_id, nullable: false, description: Version/lineage of this distribution spec.}
-
-  foundation_pmf:
-    domain: attribute_uncertainty
-    storage: postgres
-    grain: One row per (building, foundation_class) probability-mass entry.
-    description: >
-      Explicit representation of the "shuffled" foundation type. Stores the
-      probability mass per class plus the shuffle/sampling policy so that draws
-      are reproducible and consistent across a community run.
-    columns:
-      - {name: pmf_id,          type: bigint,      pk: true, nullable: false, description: Surrogate primary key.}
-      - {name: building_id,     type: bigint,      fk: buildings.building_id, nullable: false, description: Structure this PMF applies to.}
-      - {name: foundation_class,type: varchar(24), nullable: false, description: Foundation class (enum foundation_class).}
-      - {name: probability,     type: real,        nullable: false, description: Probability mass for the class; sums to 1 per building.}
-      - {name: shuffle_policy,  type: varchar(24), nullable: false, description: 'independent | region_correlated | inventory_locked (enum shuffle_policy).'}
-      - {name: version_id,      type: bigint,      fk: versioning.version_id, nullable: false, description: Version of this PMF.}
-
-# -----------------------------------------------------------------------------
-# DOMAIN C — HAZARD LINKAGE  (probabilistic flood depth)
-# -----------------------------------------------------------------------------
-  events:
-    domain: hazard_linkage
-    storage: postgres
-    grain: One row per hazard event / scenario.
-    description: >
-      Canonical registry of hazard events and scenarios. Gives the event_id
-      referenced by run_catalog, hazard_links, and loss_realizations a single
-      authoritative home so every run, hazard surface, and loss draw ties back
-      to a named, versioned scenario.
-    columns:
-      - {name: event_id,      type: bigint,       pk: true, nullable: false, description: Surrogate primary key.}
-      - {name: event_name,    type: varchar(96),  nullable: false, description: Human-readable event/scenario name.}
-      - {name: peril_type,    type: varchar(12),  nullable: false, description: 'riverine | coastal | compound (enum peril_type).'}
-      - {name: aep,           type: real,         nullable: true,  description: Representative annual exceedance probability, if AEP-based.}
-      - {name: return_period, type: real,         nullable: true,  description: Representative return period in years, if applicable.}
-      - {name: description,   type: text,         nullable: true,  description: Free-text scenario description / assumptions.}
-      - {name: source,        type: varchar(128), nullable: true,  description: Source model or study that defined the event.}
-      - {name: version_id,    type: bigint,       fk: versioning.version_id, nullable: false, description: Version/lineage of this event definition.}
-      - {name: created_at,    type: timestamptz,  nullable: false, description: Row insertion timestamp.}
-
-  hazard_links:
-    domain: hazard_linkage
-    storage: postgres
-    grain: One row per (building, AEP/event) hazard association.
-    description: >
-      Links a structure to a versioned gridded depth surface (Icechunk/Zarr)
-      and its uncertainty layer, instead of copying a scalar depth into the
-      building row. Supports AEP depth rasters plus velocity/duration/uncertainty
-      layers (Inland Consequences pattern).
-    columns:
-      - {name: hazard_link_id,   type: bigint,       pk: true, nullable: false, description: Surrogate primary key.}
-      - {name: building_id,      type: bigint,       fk: buildings.building_id, nullable: false, description: Structure.}
-      - {name: event_id,         type: bigint,       fk: events.event_id, nullable: true, description: Event/scenario this surface represents (null for pure AEP surfaces).}
-      - {name: aep,              type: real,         nullable: true,  description: Annual exceedance probability of the associated surface.}
-      - {name: peril_type,       type: varchar(12),  nullable: false, description: riverine | coastal | compound (enum peril_type).}
-      - {name: depth_grid_uri,   type: varchar(256), nullable: false, description: Icechunk repo/branch URI for the depth field (versioned).}
-      - {name: velocity_grid_uri,type: varchar(256), nullable: true,  description: Optional velocity field URI.}
-      - {name: duration_grid_uri,type: varchar(256), nullable: true,  description: Optional duration field URI.}
-      - {name: depth_dist_family,type: varchar(24),  nullable: false, description: Distribution family of depth-in-structure uncertainty.}
-      - {name: depth_parameters, type: jsonb,        nullable: false, description: 'Params of the depth-in-structure distribution at this point.'}
-      - {name: grid_version,     type: varchar(64),  nullable: false, description: Icechunk snapshot/commit id for reproducibility.}
-
-# -----------------------------------------------------------------------------
-# DOMAIN D — DDF  (probabilistic depth-damage functions)
-# -----------------------------------------------------------------------------
-  ddf_library:
-    domain: ddf
-    storage: postgres
-    grain: One row per depth-damage function version.
-    description: >
-      Versioned registry of depth-damage functions keyed by SPHERE ddf ids
-      (bddf_id/cddf_id/iddf_id). Maps functions to occupancy, foundation and
-      peril so damage-function assignment is explicit and auditable.
-    columns:
-      - {name: ddf_id,           type: bigint,       pk: true, nullable: false, description: Surrogate primary key.}
-      - {name: ddf_code,         type: varchar(48),  nullable: false, description: External id (maps to bddf_id/cddf_id/iddf_id).}
-      - {name: ddf_kind,         type: varchar(12),  nullable: false, description: building | content | inventory (enum ddf_kind).}
-      - {name: peril_type,       type: varchar(12),  nullable: false, description: riverine | coastal | compound.}
-      - {name: occupancy_type,   type: varchar(16),  nullable: true,  description: Occupancy the DDF applies to.}
-      - {name: foundation_class, type: varchar(24),  nullable: true,  description: Foundation class the DDF applies to.}
-      - {name: source_library,   type: varchar(64),  nullable: false, description: Library of origin (e.g. OpenHazus, USACE, FIA).}
-      - {name: version_id,       type: bigint,       fk: versioning.version_id, nullable: false, description: Version/lineage of this DDF.}
-
-  ddf_uncertainty:
-    domain: ddf
-    storage: postgres
-    grain: One row per (ddf, depth) percentile envelope.
-    description: >
-      Makes the DDF itself a distribution. Stores per-depth central tendency and
-      percentile spread so a realization can draw a DDF percentile rather than
-      using a single mean curve.
-    columns:
-      - {name: ddf_unc_id,   type: bigint,  pk: true, nullable: false, description: Surrogate primary key.}
-      - {name: ddf_id,       type: bigint,  fk: ddf_library.ddf_id, nullable: false, description: Parent DDF.}
-      - {name: depth_ft,     type: real,    nullable: false, description: Flood depth relative to first floor, feet.}
-      - {name: damage_mean,  type: real,    nullable: false, description: "Mean damage ratio in [0,1] at this depth."}
-      - {name: damage_p10,   type: real,    nullable: true,  description: 10th percentile damage ratio.}
-      - {name: damage_p50,   type: real,    nullable: true,  description: Median damage ratio.}
-      - {name: damage_p90,   type: real,    nullable: true,  description: 90th percentile damage ratio.}
-      - {name: dist_family,  type: varchar(24), nullable: true, description: Optional parametric family of the damage-ratio spread.}
-      - {name: parameters,   type: jsonb,   nullable: true,  description: Optional parametric spread params at this depth.}
-
-# -----------------------------------------------------------------------------
-# DOMAIN E — REALIZATION & LOSS RESULTS  (ensemble scale)
-# -----------------------------------------------------------------------------
-  loss_realizations:
-    domain: realization_results
     storage: iceberg
-    grain: One row per (building x event/AEP x Monte Carlo draw).
+    grain: One row per structure per source inventory.
     description: >
-      Ensemble-scale table of per-draw sampled inputs and resulting losses.
-      Iceberg tier for billions of rows with partition pruning and time-travel.
-      Every row is reproducible from its seed + version pointers.
-    partitioned_by: [event_id, aep]
+      Flat inventory projection on the NSI field set. Every NSI parquet column
+      maps 1:1 to a column on this table, using NSI's native field names
+      (occtype, num_story, val_struct, pop2amu65, …) so queries line up with
+      the raw source. Other inventories map onto the same columns through a
+      YAML source spec (ADR-multi-source); their unmapped fields are NULL.
+      Sources sit side by side, scoped by source_ref, so one physical
+      structure can appear once per source — aggregates across sources
+      double count. Geometry lives in the `geometries` table (ADR-geometry
+      preserved). Component decomposition, attribute uncertainty specs,
+      hazard links, DDFs, loss realizations, export contracts, provenance
+      registry, and valid-time (bitemporal) history are deferred; re-entry
+      points are documented in ADR-nsi-minimal. The primary key `building_id`
+      is the NSI `fd_id` for NSI rows and a hash of (source_ref,
+      source_record_id) for every other source, so ids are stable across
+      re-ingests and versions. Loads MERGE a full replacement of one source
+      into a branch; other sources are untouched, and earlier states stay
+      readable through version tags (ADR-versioning). Physical layout: partitioned by state
+      (Iceberg `truncate(2, cbfips)`) and sorted by `cbfips`; merge-on-read
+      writes.
     columns:
-      - {name: realization_id,     type: bigint,  nullable: false, description: Draw identifier within the run.}
-      - {name: building_id,        type: bigint,  nullable: false, description: Structure (logical FK to buildings).}
-      - {name: run_id,             type: bigint,  nullable: false, description: Producing run (logical FK to run_catalog).}
-      - {name: event_id,           type: bigint,  nullable: true,  description: Event/scenario id, logical FK to events (partition key).}
-      - {name: aep,                type: real,    nullable: true,  description: Annual exceedance probability (partition key).}
-      - {name: seed,               type: bigint,  nullable: false, description: RNG seed for exact reproducibility.}
-      - {name: depth_in_structure, type: real,    nullable: false, description: Sampled depth in structure, feet.}
-      - {name: foundation_type,    type: varchar(24), nullable: false, description: Sampled/shuffled foundation class this draw.}
-      - {name: first_floor_height, type: real,    nullable: false, description: Sampled first-floor height, feet.}
-      - {name: ddf_percentile,     type: real,    nullable: false, description: "Sampled DDF percentile in [0,1]."}
-      - {name: bddf_id,            type: varchar(48), nullable: true, description: Building DDF applied.}
-      - {name: cddf_id,            type: varchar(48), nullable: true, description: Content DDF applied.}
-      - {name: iddf_id,            type: varchar(48), nullable: true, description: Inventory DDF applied.}
-      - {name: building_damage_percent, type: real, nullable: true, description: "Structure damage ratio in [0,1]."}
-      - {name: building_loss,      type: double,  nullable: true,  description: Structure loss, USD.}
-      - {name: content_loss,       type: double,  nullable: true,  description: Contents loss, USD.}
-      - {name: inventory_loss,     type: double,  nullable: true,  description: Inventory loss, USD.}
-      - {name: total_loss,         type: double,  nullable: true,  description: Sum of building+content+inventory loss, USD.}
+      - {name: building_id,  type: bigint,       pk: true, nullable: false, description: 'Stable primary key (unique, asserted in smoke tests). NSI rows: the fd_id. Other sources: xxhash64(source_ref, source_record_id) with the sign bit set, so always negative and never equal to an NSI id.'}
+      - {name: source_ref,   type: varchar(64),  fk: sources.source_ref, nullable: false, description: 'Inventory the row came from (NSI, COUNTY-ASSESSOR, ...). Loads replace only their own source''s rows. Rows written before the multi-source migration read as NSI.'}
+      - {name: source_record_id, type: varchar(128), nullable: true, description: 'Native id of the structure in its source (RQM-04), as a string; NSI: the fd_id. Unique per source_ref.'}
+      - {name: fd_id,        type: bigint,       nullable: true,  description: NSI structure id (external natural key; source of building_id for NSI rows; NULL for other sources unless they map it; logically UNIQUE where not null).}
+      - {name: bid,          type: varchar(32),  nullable: true,  description: 'NSI building id (UBID — Open Location Code plus extents, e.g. 8645XMJC+QG9-2-2-3-1).'}
+      - {name: usastrucid,   type: varchar(32),  nullable: true,  description: FEMA USA Structures id (joins to USAS footprint source).}
+      - {name: ftprntid,     type: varchar(64),  nullable: true,  description: Footprint id as reported by NSI (joins to geometries.source_ref when the footprint source is attached).}
+      - {name: ftprntsrc,    type: varchar(32),  nullable: true,  description: Footprint source tag (MSBF, USAS, ...).}
+      - {name: source,       type: varchar(32),  nullable: true,  description: 'NSI per-structure source code (e.g., P, H); geometries.source_ref is NSI-<source>.'}
+      - {name: occtype,      type: varchar(16),  nullable: false, description: Occupancy classification code (enum occtype; e.g., RES1, COM1).}
+      - {name: st_damcat,    type: varchar(16),  nullable: true,  description: Structure damage category (enum st_damcat; RES, COM, IND, PUB, AGR).}
+      - {name: bldgtype,     type: varchar(16),  nullable: true,  description: Construction class code (e.g., W1 wood light-frame, M1 masonry).}
+      - {name: num_story,    type: smallint,     nullable: true,  description: Story count.}
+      - {name: sqft,         type: double,       nullable: true,  description: Reported structure area, square feet.}
+      - {name: ftprntsqft,   type: double,       nullable: true,  description: Footprint-derived area, square feet (may differ from sqft for multi-story structures).}
+      - {name: bldheight,    type: real,         nullable: true,  description: Building height, feet.}
+      - {name: med_yr_blt,   type: smallint,     nullable: true,  description: Median year built for the structure (or its block/cohort).}
+      - {name: found_type,   type: varchar(16),  nullable: true,  description: Foundation type code (enum found_type; S slab, C crawlspace, B basement, P pier, F fill/elevated).}
+      - {name: found_ht,     type: real,         nullable: true,  description: First-floor height above adjacent grade, feet.}
+      - {name: val_struct,   type: double,       nullable: true,  description: Structure replacement value, USD.}
+      - {name: val_cont,     type: double,       nullable: true,  description: Contents replacement value, USD.}
+      - {name: val_vehic,    type: double,       nullable: true,  description: Vehicle value attributed to structure, USD.}
+      - {name: ornl_low,     type: double,       nullable: true,  description: ORNL low-value estimate, USD (alternate value basis).}
+      - {name: ornl_med,     type: double,       nullable: true,  description: ORNL median-value estimate, USD.}
+      - {name: ornl_hgh,     type: double,       nullable: true,  description: ORNL high-value estimate, USD.}
+      - {name: resunits,     type: real,         nullable: true,  description: Residential units contained in structure.}
+      - {name: novehprob,    type: real,         nullable: true,  description: Probability that the household has no vehicle.}
+      - {name: vehperunit,   type: real,         nullable: true,  description: Vehicles per residential unit.}
+      - {name: pop2amu65,    type: real,         nullable: true,  description: 2 AM population, under 65 years old.}
+      - {name: pop2amo65,    type: real,         nullable: true,  description: 2 AM population, 65 years old and over.}
+      - {name: pop2pmu65,    type: real,         nullable: true,  description: 2 PM population, under 65 years old.}
+      - {name: pop2pmo65,    type: real,         nullable: true,  description: 2 PM population, 65 years old and over.}
+      - {name: u65disable,   type: real,         nullable: true,  description: Under-65 disabled population attributed to structure.}
+      - {name: o65disable,   type: real,         nullable: true,  description: 65-and-over disabled population attributed to structure.}
+      - {name: students,     type: real,         nullable: true,  description: Student population attributed to structure.}
+      - {name: firmzone,     type: varchar(16),  nullable: true,  description: FIRM (Flood Insurance Rate Map) flood zone code.}
+      - {name: zone_sub,     type: varchar(16),  nullable: true,  description: FIRM zone subtype / qualifier.}
+      - {name: static_bfe,   type: real,         nullable: true,  description: Static base flood elevation, feet.}
+      - {name: ground_elv,   type: real,         nullable: true,  description: Ground elevation at structure, feet.}
+      - {name: grnd_elv_m,   type: real,         nullable: true,  description: Ground elevation at structure, meters.}
+      - {name: pctlowclr,    type: real,         nullable: true,  description: NSI pctlowclr indicator (percent low-clearance).}
+      - {name: fullrep,      type: real,         nullable: true,  description: NSI fullrep indicator (full-replacement flag or share).}
+      - {name: depindex,     type: real,         nullable: true,  description: NSI dependency index.}
+      - {name: creprcnt,     type: real,         nullable: true,  description: NSI community-resilience percent indicator.}
+      - {name: crerank,      type: real,         nullable: true,  description: 'NSI community-resilience rank (fractional, 0-1).'}
+      - {name: cbfips,       type: varchar(15),  nullable: true,  description: Census block GEOID (15-digit FIPS) for community-level aggregation.}
+      - {name: x,            type: double,       nullable: true,  description: 'Longitude (WGS84) of the structure point, as NSI publishes it; derived from the computation point for sources that do not map it. Denormalized for query convenience.'}
+      - {name: y,            type: double,       nullable: true,  description: 'Latitude (WGS84) of the structure point, as NSI publishes it; derived from the computation point for sources that do not map it. Denormalized for query convenience.'}
+      - {name: ingested_at,  type: timestamp,    nullable: false, description: 'When this row was last written: its insert, or the last load or edit that changed it. Version history lives in Iceberg snapshots + inventory_versions.'}
 
-  mv_loss_summary:
-    domain: realization_results
+  geometries:
+    domain: inventory
     storage: iceberg
-    grain: One row per (building or community, event/AEP).
+    grain: One row per (building, representation, alternate) geometric record.
     description: >
-      Materialized view pre-computing central tendency AND upper prediction
-      limits from loss_realizations. Rebuildable from source. Aggregation tier
-      where variance reduction for large-scale community analysis is realized.
+      First-class geometry registry (ADR-geometry preserved). Each row holds
+      one geometric representation of a building. Every load produces
+      exactly one row per structure with role='point',
+      purpose='computation', is_selected_for_export=true (NSI: geom from the
+      parquet `shape` column), stored as a native Iceberg v3 GEOMETRY with a
+      column-level CRS of EPSG:3857; input in other CRSs is transformed.
+      Polygon sources add a role='footprint', purpose='display' row, and
+      their computation point is ST_PointOnSurface of the footprint
+      (ADR-multi-source). Alternate footprints (MSBF, USAS)
+      land as additional rows with role='footprint' and may flip the
+      selected flag via a separate selection migration. Logical invariant:
+      exactly one row per (building_id, purpose='computation') has
+      is_selected_for_export=true at any time — enforced by the ingest script
+      and smoke tests (Iceberg does not enforce UNIQUE). 3D roles,
+      component-level geometry, and valid-time history are deferred (see
+      ADR-nsi-minimal re-entry map). Versioned together with buildings
+      (same tag per version). A reload never overwrites
+      is_selected_for_export, deletes only its own source's missing rows,
+      and deletes rows from any source whose building is gone. Physical layout: unpartitioned
+      by default (configurable via TableLayout in tools/ingest_nsi.py);
+      merge-on-read writes.
     columns:
-      - {name: summary_id,     type: bigint,  nullable: false, description: Surrogate key.}
-      - {name: agg_level,      type: varchar(16), nullable: false, description: 'building | census_block | community (enum agg_level).'}
-      - {name: agg_key,        type: varchar(32), nullable: false, description: Identifier at the aggregation level.}
-      - {name: event_id,       type: bigint,  nullable: true,  description: Event/scenario id.}
-      - {name: aep,            type: real,    nullable: true,  description: Annual exceedance probability.}
-      - {name: n_realizations, type: integer, nullable: false, description: Number of draws in the aggregate.}
-      - {name: loss_mean,      type: double,  nullable: false, description: Mean total loss, USD (central tendency).}
-      - {name: loss_median,    type: double,  nullable: true,  description: Median total loss, USD.}
-      - {name: loss_p90,       type: double,  nullable: true,  description: 90th percentile total loss (upper prediction limit).}
-      - {name: loss_p95,       type: double,  nullable: true,  description: 95th percentile total loss (upper prediction limit).}
-      - {name: loss_cv,        type: real,    nullable: true,  description: Coefficient of variation (variance diagnostic).}
-      - {name: aal,            type: double,  nullable: true,  description: Average annualized loss across AEPs, USD.}
-      - {name: run_id,         type: bigint,  nullable: false, description: Producing run for provenance.}
+      - {name: geometry_id,            type: bigint,       pk: true, nullable: false, description: 'Stable primary key: xxhash64 of the natural key (source_ref, building_id, role, purpose, alt_group_key), so a geometry keeps its id across re-ingests and selection changes. The ingest refuses a write whose id collides with a different natural key.'}
+      - {name: building_id,            type: bigint,       fk: buildings.building_id, nullable: false, description: Parent structure (logical FK; cascade behavior enforced by the ingest contract).}
+      - {name: role,                   type: varchar(16),  nullable: false, description: 'Geometry role (enum geometry_role): point | footprint. 3D roles deferred.'}
+      - {name: purpose,                type: varchar(16),  nullable: false, description: 'Why this representation exists (enum geometry_purpose): computation | hazard_sampling | display | qc.'}
+      - {name: is_selected_for_export, type: boolean,      nullable: false, description: Exactly one TRUE per (building_id, purpose='computation') at any time (logical invariant; asserted in smoke tests).}
+      - {name: alt_group_key,          type: varchar(64),  nullable: true,  description: Groups competing alternates at the same (building_id, role) — e.g., two footprints from different sources share a key.}
+      - {name: source_ref,             type: varchar(64),  nullable: true,  description: 'Source dataset that derived the geometry: the building''s sources.source_ref, or <source_ref>-<subcode> (NSI-P, NSI-H). Part of the geometry_id natural key.'}
+      - {name: crs,                    type: varchar(16),  nullable: false, description: 'EPSG string for this row''s geometry; must equal the geom column CRS (EPSG:3857), so alternates are reprojected on load.'}
+      - {name: geom,                   type: geometry,     nullable: false, description: 'Native Iceberg v3 GEOMETRY(EPSG:3857); Point for role=''point'', Polygon/MultiPolygon for role=''footprint''. Sedona reads it via ST_GeomFromWKB(spark_st_asbinary(geom)).'}
+      - {name: ingested_at,            type: timestamp,    nullable: false, description: 'When this row was last written (insert, or a load that changed its point or CRS).'}
 
-# -----------------------------------------------------------------------------
-# DOMAIN F — PROVENANCE & VERSIONING  (versioning / provenance)
-# -----------------------------------------------------------------------------
-  run_catalog:
-    domain: provenance
-    storage: postgres
-    grain: One row per cloud-compute run.
+  sources:
+    domain: inventory
+    storage: iceberg
+    grain: One row per source inventory (dataset lineage).
     description: >
-      One row per run pairing an event/scenario with a model+config version.
+      Registry of the inventories loaded into buildings (ADR-multi-source).
+      A source_ref names a dataset lineage (NSI, COUNTY-ASSESSOR, ...) that
+      stays the same across its releases; releases are told apart by version
+      name and inventory_versions.source_uri. Upserted from the source's YAML
+      mapping spec on every load, on main only (not versioned or branched),
+      and never deleted, so every version's buildings.source_ref values
+      resolve. The built-in NSI source is registered by the first NSI load
+      (or by the schema migration of a pre-existing warehouse).
     columns:
-      - {name: run_id,       type: bigint,      pk: true, nullable: false, description: Surrogate primary key.}
-      - {name: event_id,     type: bigint,      fk: events.event_id, nullable: true,  description: Event/scenario executed.}
-      - {name: manifest_id,  type: bigint,      fk: manifests.manifest_id, nullable: false, description: Software/config manifest used.}
-      - {name: run_type,     type: varchar(24), nullable: false, description: 'Kind of run: loss | sensitivity | calibration (enum run_type).'}
-      - {name: status,       type: varchar(16), nullable: false, description: queued|running|success|failed|superseded.}
-      - {name: n_realizations, type: integer,   nullable: true,  description: Monte Carlo draws requested.}
-      - {name: started_at,   type: timestamptz, nullable: true,  description: Run start time.}
-      - {name: finished_at,  type: timestamptz, nullable: true,  description: Run completion time.}
+      - {name: source_ref,  type: varchar(64),  pk: true, nullable: false, description: 'Source identifier; upper-case letters, digits, ".", "_", "-" (starts with a letter or digit). NSI is reserved for the built-in National Structure Inventory spec.'}
+      - {name: source_name, type: varchar(200), nullable: false, description: Human-readable name.}
+      - {name: source_kind, type: varchar(32),  nullable: false, description: 'Enum source_kind: national_inventory, local_inventory, commercial_inventory, project_inventory, field_survey, remote_sensing, or other.'}
+      - {name: description, type: text,         nullable: true,  description: Free text.}
+      - {name: spec_sha256, type: varchar(64),  nullable: true,  description: SHA-256 of the YAML mapping spec last used to load the source.}
+      - {name: updated_at,  type: timestamp,    nullable: false, description: When the row was last written.}
 
-  manifests:
-    domain: provenance
-    storage: postgres
-    grain: One row per software/config manifest.
+  inventory_versions:
+    domain: inventory
+    storage: iceberg
+    grain: One row per named inventory version.
     description: >
-      Captures the exact software configuration (plugin names, versions,
-      distribution + DDF library versions) so a run is fully reconstructable.
+      Version registry (ADR-versioning). Each row names an immutable state of
+      the inventory: `version_name` is also an Iceberg tag on `buildings` and
+      `geometries` pointing at the recorded snapshots, so the version reads as
+      `SELECT … FROM rqm.inventory.buildings VERSION AS OF '<version_name>'`.
+      Records who committed it, why, from which input, on which branch, its
+      lineage (parent and merged versions), and change counts relative to the
+      parent. Written last when a version is committed, so a version exists
+      only once registered; a tag without a row is an incomplete commit.
     columns:
-      - {name: manifest_id,      type: bigint,       pk: true, nullable: false, description: Surrogate primary key.}
-      - {name: engine_version,   type: varchar(32),  nullable: false, description: Sampling/consequence engine version.}
-      - {name: ddf_library_version, type: varchar(32), nullable: true, description: DDF library version pinned for the run.}
-      - {name: dist_ruleset_version, type: varchar(32), nullable: true, description: Attribute-distribution ruleset version.}
-      - {name: config,           type: jsonb,        nullable: true,  description: Full serialized run configuration.}
-      - {name: created_at,       type: timestamptz,  nullable: false, description: Manifest creation timestamp.}
+      - {name: version_name,           type: varchar(100), pk: true, nullable: false, description: 'Version name; also the Iceberg tag name. Letters, digits, ".", "_", "-".'}
+      - {name: parent_version,         type: varchar(100), fk: inventory_versions.version_name, nullable: true,  description: Version this one was derived from (NULL for a root load). For merges, the previous version of the target branch.}
+      - {name: merged_version,         type: varchar(100), fk: inventory_versions.version_name, nullable: true,  description: 'For kind=merge: the branch version merged in.'}
+      - {name: branch,                 type: varchar(100), nullable: false, description: Iceberg branch the version was committed on (main or a project branch).}
+      - {name: kind,                   type: varchar(16),  nullable: false, description: 'Enum version_kind: release, edit, or merge.'}
+      - {name: source_ref,             type: varchar(64),  fk: sources.source_ref, nullable: true, description: 'Source a release loaded (ADR-multi-source); NULL for edits, merges, and versions committed before multi-source support.'}
+      - {name: source_uri,             type: text,         nullable: true,  description: Input file loaded for the version (NULL for in-place edits and merges).}
+      - {name: source_sha256,          type: varchar(64),  nullable: true,  description: SHA-256 of the input file.}
+      - {name: editor,                 type: varchar(100), nullable: false, description: Who committed the version (RQM-16).}
+      - {name: reason,                 type: text,         nullable: true,  description: Why the version was committed (RQM-16).}
+      - {name: buildings_snapshot_id,  type: bigint,       nullable: false, description: Iceberg snapshot of buildings tagged with version_name.}
+      - {name: geometries_snapshot_id, type: bigint,       nullable: false, description: Iceberg snapshot of geometries tagged with version_name.}
+      - {name: n_buildings,            type: bigint,       nullable: false, description: Buildings in the version.}
+      - {name: n_added,                type: bigint,       nullable: false, description: Buildings added relative to parent_version (all of them for a root version).}
+      - {name: n_removed,              type: bigint,       nullable: false, description: Buildings removed relative to parent_version.}
+      - {name: n_changed,              type: bigint,       nullable: false, description: Buildings whose attributes or selected computation geometry changed relative to parent_version.}
+      - {name: created_at,             type: timestamp,    nullable: false, description: When the version was committed (record time).}
 
-  run_logs:
-    domain: provenance
-    storage: postgres
-    grain: One row per run log pointer.
-    description: URI to full container/execution logs for a run.
-    columns:
-      - {name: log_id,   type: bigint,       pk: true, nullable: false, description: Surrogate primary key.}
-      - {name: run_id,   type: bigint,       fk: run_catalog.run_id, nullable: false, description: Run the log belongs to.}
-      - {name: log_uri,  type: varchar(256), nullable: false, description: Object-store URI to full logs.}
-
-  versioning:
-    domain: provenance
-    storage: postgres
-    grain: One row per versioned entity snapshot.
+  inventory_changes:
+    domain: inventory
+    storage: iceberg
+    grain: One row per (version, building) added, removed, or modified relative to the version's parent.
     description: >
-      The "Versioning" standard applied to every distribution, PMF, DDF, and
-      inventory snapshot so downstream/third-party users can reference versions
-      and log extensions. Central lineage registry.
+      Per-building change log (ADR-versioning), attributed through
+      inventory_versions (editor, reason, created_at). Answers "which
+      versions changed building X, how, and who did it" without scanning
+      table history. Root versions have no rows; every building in them
+      counts as added. Counts per version equal the registry's n_added /
+      n_removed / n_changed.
     columns:
-      - {name: version_id,   type: bigint,       pk: true, nullable: false, description: Surrogate primary key.}
-      - {name: entity_type,  type: varchar(32),  nullable: false, description: 'Versioned entity kind (enum entity_type).'}
-      - {name: entity_ref,   type: varchar(64),  nullable: false, description: Natural/business key of the versioned entity.}
-      - {name: semver,       type: varchar(16),  nullable: false, description: Semantic version string (e.g. 1.2.0).}
-      - {name: parent_version_id, type: bigint,  fk: versioning.version_id, nullable: true, description: Lineage pointer to prior version.}
-      - {name: author,       type: varchar(64),  nullable: true,  description: Author/owner of the version.}
-      - {name: created_at,   type: timestamptz,  nullable: false, description: Version creation timestamp.}
+      - {name: version_name,    type: varchar(100),  pk: true, fk: inventory_versions.version_name, nullable: false, description: Version that made the change.}
+      - {name: building_id,     type: bigint,        pk: true, fk: buildings.building_id, nullable: false, description: Changed building (logical FK; a removed building is absent from the head but present in earlier versions).}
+      - {name: change_kind,     type: varchar(16),   nullable: false, description: 'Enum change_kind: added, removed, or modified.'}
+      - {name: changed_columns, type: 'varchar[]', nullable: true, description: 'For modified rows: the buildings columns that changed, plus geom when the selected computation geometry changed.'}

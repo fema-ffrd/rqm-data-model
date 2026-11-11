@@ -1,0 +1,27 @@
+# Demo source spec: a field survey (synthetic; tools/synthetic_sources.py).
+# CSV with GPS lon / lat; a sparse mapping, so most buildings fields stay NULL.
+source_ref: FIELD-SURVEY-2025
+source_name: 2025 First-Floor Elevation Field Survey
+source_kind: field_survey
+description: >
+  Synthetic 2025 field campaign measuring first-floor height, foundation
+  type, and stories at a few hundred structures.
+input:
+  format: csv
+  crs: EPSG:4326
+  geometry: {kind: point, lon: LON, lat: LAT}
+id: {column: SURVEY_ID}
+fields:
+  occtype:
+    from: USE_OBSERVED
+    map: {Residential: RES1, Commercial: COM1, Industrial: IND2}
+    default: RES1
+  st_damcat:
+    from: USE_OBSERVED
+    map: {Residential: RES, Commercial: COM, Industrial: IND}
+  found_ht: FFH_FT
+  found_type:
+    from: FOUNDATION
+    map: {"Slab on grade": S, Crawlspace: C, Basement: B, "Pier/post": P}
+  num_story: STORIES
+  cbfips: BLOCK_GEOID
