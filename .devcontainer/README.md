@@ -26,10 +26,10 @@ Keep large NSI inputs, Iceberg warehouses, and exports there:
 ```
 /data/rqm/
 ├── data/nsi2026_public_wkb.parquet   # nationwide NSI input
-├── warehouse-notebook/               # Iceberg warehouse (01_setup_demo.ipynb)
-├── exports-notebook/                 # analysis-ready exports
-├── versioning-notebook/              # 02_versioning_demo.ipynb scratch (recreated each run)
-└── multi-source-notebook/            # 03_multi_source_demo.ipynb scratch (recreated each run)
+├── warehouse-notebook/               # Iceberg warehouse + catalog.db shared by the three demos (reset by 01)
+├── exports-notebook/                 # analysis-ready exports (01_setup_demo.ipynb)
+├── versioning-notebook/              # 02_versioning_demo.ipynb inputs/exports (recreated each run)
+└── multi-source-notebook/            # 03_multi_source_demo.ipynb inputs/exports (recreated each run)
 ```
 
 After the first rebuild with the volume, copy the nationwide file in once
