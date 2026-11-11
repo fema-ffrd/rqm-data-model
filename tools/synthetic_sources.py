@@ -14,7 +14,7 @@ native ids.
 | FIELD-SURVEY-2025  | CSV lon / lat (EPSG:4326)    | sparse mapping (most fields NULL)       |
 | PROJECT-RIVERBEND  | parquet, WKB points (EPSG:3857) | planned structures for a project branch |
 
-The matching specs live in `notebooks/sources/*.yaml`.
+The matching specs live in `test/data/sources/*.yaml`.
 
 Usage
 -----

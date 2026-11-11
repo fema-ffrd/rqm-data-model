@@ -90,8 +90,7 @@ rqm-data-model/
 ├── notebooks/
 │   ├── 01_setup_demo.ipynb        # nationwide ingest + watershed export demo
 │   ├── 02_versioning_demo.ipynb   # versioning walkthrough on the NSI sample
-│   ├── 03_multi_source_demo.ipynb # multi-source walkthrough (synthetic sources)
-│   └── sources/                   # demo source specs (YAML)
+│   └── 03_multi_source_demo.ipynb # multi-source walkthrough (synthetic sources)
 ├── tools/
 │   ├── ingest_nsi.py              # CLI: NSI parquet → Iceberg via Sedona (MERGE + --version)
 │   ├── ingest_source.py           # CLI: any inventory via a YAML source spec
@@ -111,6 +110,7 @@ rqm-data-model/
 │   ├── test_spark_settings.py     # unit tests for session/catalog/layout config
 │   └── data/
 │       ├── nsi.parquet            # sample NSI extract (46 cols, ~45k rows)
+│       ├── sources/               # demo source specs (YAML) for the synthetic sources
 │       └── README.md              # provenance of the sample
 └── LICENSE
 ```
@@ -192,7 +192,7 @@ Describe the source in a YAML spec. The spec says how to read the file (parquet,
 
 ```bash
 python tools/synthetic_sources.py --nsi test/data/nsi.parquet --out /data/rqm/synthetic
-python tools/ingest_source.py --spec notebooks/sources/county-assessor.yaml \
+python tools/ingest_source.py --spec test/data/sources/county-assessor.yaml \
     --input /data/rqm/synthetic/county-assessor-r1.gpkg --warehouse test/warehouse \
     --version assessor-r1 --editor jdoe --reason "county assessor roll"
 

@@ -21,7 +21,7 @@ import pytest
 
 TEST_DIR = Path(__file__).resolve().parent
 REPO = TEST_DIR.parent
-SPECS = REPO / "notebooks" / "sources"
+SPECS = REPO / "test" / "data" / "sources"
 WAREHOUSE = TEST_DIR / "warehouse-multisource-pytest"
 MIGRATION_WAREHOUSE = TEST_DIR / "warehouse-migration-pytest"
 CATALOG = "rqmm"

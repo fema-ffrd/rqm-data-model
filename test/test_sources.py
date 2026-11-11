@@ -10,7 +10,7 @@ import yaml
 
 TEST_DIR = Path(__file__).resolve().parent
 REPO = TEST_DIR.parent
-DEMO_SPECS = sorted((REPO / "notebooks" / "sources").glob("*.yaml"))
+DEMO_SPECS = sorted((TEST_DIR / "data" / "sources").glob("*.yaml"))
 
 from sources import (  # type: ignore[import-not-found]
     ENUM_FIELDS,

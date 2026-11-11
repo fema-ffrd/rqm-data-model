@@ -6,7 +6,7 @@
 **Builds on:** [ADR-nsi-minimal](ADR-nsi-minimal.md) (amends validation rule 7), [ADR-versioning](ADR-versioning.md)
 **Serves user stories:** RQM-04 (national, local, commercial, or project-specific inventories; keep each source's native identifier)
 **Implementation:** `tools/schema.sql`, `tools/sources.py`, `tools/sources/nsi.yaml`, `tools/ingest_source.py`, `tools/ingest_nsi.py`, `tools/versioning.py`, `tools/rqm_version.py`
-**Tests / demo:** `test/test_sources.py`, `test/test_multi_source.py`, `notebooks/03_multi_source_demo.ipynb` (synthetic sources from `tools/synthetic_sources.py`, specs in `notebooks/sources/`)
+**Tests / demo:** `test/test_sources.py`, `test/test_multi_source.py`, `notebooks/03_multi_source_demo.ipynb` (synthetic sources from `tools/synthetic_sources.py`, specs in `test/data/sources/`)
 **Plan:** [multi-source-inventory-plan](../plans/multi-source-inventory-plan.md)
 
 ## Context
@@ -73,7 +73,7 @@ The registry row is upserted from the spec on every load, before the data `MERGE
 
 ### 4. The mapping spec
 
-One YAML file per source (`tools/sources.py`; demo specs in `notebooks/sources/`):
+One YAML file per source (`tools/sources.py`; demo specs in `test/data/sources/`):
 
 ```yaml
 source_ref: COUNTY-ASSESSOR

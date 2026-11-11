@@ -4,7 +4,7 @@ spec (ADR-multi-source).
 Usage
 -----
     python tools/ingest_source.py \
-        --spec notebooks/sources/county-assessor.yaml \
+        --spec test/data/sources/county-assessor.yaml \
         --input /data/rqm/assessor-r1.gpkg \
         --warehouse test/warehouse \
         --version assessor-r1 --editor jdoe --reason "county assessor roll 2025"

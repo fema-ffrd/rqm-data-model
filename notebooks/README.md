@@ -37,7 +37,7 @@ Walkthrough of multi-source inventories ([ADR-multi-source](../docs/decisions/AD
 - a field survey: CSV with lon / lat and a sparse mapping;
 - a planned development: parquet with WKB points.
 
-Their mapping specs are in [`sources/`](sources/). The notebook covers:
+Their mapping specs are in [`test/data/sources/`](../test/data/sources/). The notebook covers:
 
 - validating the specs, including a rejected one;
 - loading the assessor and the survey as versions `assessor-r1` and `survey-2025`, beside the NSI inventory that 02 left at `nsi-sample-v7`, then inspecting the `sources` registry and the version lineage;
