@@ -1,0 +1,52 @@
+# Risk Quantification Methodology: User Stories and Personas
+
+**Current focus:** Buildings
+
+**Future scope:** Other infrastructure and hazards
+
+## Scope
+
+These stories add building-data needs not fully covered by the existing FFRD user stories. In this document, **asset** refers to a building or other infrastructure represented in the data model. A later validated version will show how the proposed architecture, tables, fields, and relationships support each story.
+
+The persona represent the primary user roles associated with the current RQM requirements. They clarify who is expected to prepare, manage, analyze, govern, or use the information.
+
+## User Stories
+
+| #      | Title                                   | I need to...                                                                                                                                          | So that I can...                                                                                                                              |
+| ------ | --------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------- |
+| RQM-01 | Multiple Geometry Representations       | Represent the same asset as a point, 2D footprint, simple 3D form, or detailed 3D form, including alternative representations from different sources. | Use the appropriate geometry while retaining the asset's identity and other available representations, such as different building footprints. |
+| RQM-02 | Stable Asset Identity and Revisions     | Preserve an asset's identity when its location, attributes, geometry, or status changes.                                                              | Track revisions without overwriting the original record or creating a different asset.                                                        |
+| RQM-03 | Inventory Versioning and Branching      | Create project-specific inventories that remain linked to their source inventory.                                                                     | Compare versions, reproduce earlier analyses, and identify the inventory used for each calculation.                                           |
+| RQM-04 | Multiple Source Inventories             | Use asset data from national, local, commercial, or project-specific inventories.                                                                     | Apply a consistent methodology while retaining source-specific identifiers and information.                                                   |
+| RQM-05 | Asset Components and Relationships      | Represent an asset and its components as related, identifiable objects.                                                                               | Add component-level information without redesigning the complete asset model.                                                                 |
+| RQM-06 | Calculation-Ready Data Exports          | Prepare the asset data required by different consequence calculation tools.                                                                           | Support different tools while retaining links to the source asset and inventory version.                                                      |
+| RQM-07 | Data and Assumption Traceability        | Retain the sources, assumptions, defaults, and changes applied to asset data.                                                                         | Understand how calculation-ready values were produced and reproduce them when needed.                                                         |
+| RQM-08 | Asset Attribute Uncertainty             | Associate optional uncertainty information with estimated or modeled asset attributes.                                                                | Evaluate how uncertainty in asset information may affect consequence results.                                                                 |
+| RQM-09 | Asset-to-Result Linkage                 | Link each result to the asset version, geometry, hazard, export, and calculation method used.                                                         | Trace and compare results when asset data, hazards, or calculation methods change.                                                            |
+| RQM-10 | Infrastructure and Hazard Extensibility | Add asset types and hazard-specific information without redesigning the core asset model.                                                             | Extend the methodology beyond buildings and flooding while reusing identity, geometry, and traceability capabilities.                         |
+| RQM-11 | Multi-user Revisions                    | Capture the overall differences between editing stages when multiple users may be making revisions to the same dataset in parallel.                   | Ensure editing conflicts are resolved logically and a minimal data footprint is retained.                                                     |
+| RQM-12 | GIS-based Revision Tracking             | Track changes made to an inventory from within common GIS software.                                                                                   | Allow GIS analysts to review and revise the inventory while capturing the update history.                                                     |
+| RQM-13 | Asset Hierarchy and Structure           | Represent an asset and its components as hierarchical objects within a morphological data structure.                                                  | Execute quality-control procedures for logical building representation and analyze component-level dependencies.                              |
+| RQM-14 | Event-Derived Uncertainty               | Parameterize uncertainty information based on event-based hazard realizations and specified distribution options.                                     | Customize uncertainty representation using the most appropriate distribution for the hazard results.                                          |
+| RQM-15 | Attribute Uncertainty Modularity        | Represent uncertainty using interchangeable distributions or parameters.                                                                              | Change the uncertainty representation and rerun an analysis with minimal process changes.                                                     |
+| RQM-16 | Revision Attribution                    | Capture the editor, edit time, and reasoning for changes made to the building inventory during each editing phase.                                    | Trace and quality-check inventory changes for review questions and long-term maintenance.                                                     |
+| RQM-17 | Uncertainty Hierarchy and Structure     | Represent uncertainty as continuous and categorical distributions that can be shared between attributes.                                              | Assign uncertainty to multiple attributes with minimal data-model rework.                                                                     |
+| RQM-18 | Alternative Schema Export               | Export from the RQM schema to a richer alternative data-model schema, such as CityJSON or 3DCityDB, with a highly specified hierarchy.                | Ensure future integration with a CityGML-style schema remains feasible for possible integration with OGC or BIM industry standards.           |
+| RQM-19 | Public and Restricted Data              | Identify which asset attributes and source references are public or restricted.                | Create appropriate exports without exposing protected information while retaining traceability for authorized users.           |
+| RQM-20 | Benefit-Cost Analysis (BCA) Integration | Package asset, hazard, consequence, uncertainty, and metadata information in a form consumable by Benefit-Cost Analysis workflows and tools. | Produce traceable, reproducible, and defensible benefit-cost calculations that support mitigation prioritization, funding justification, and investment decisions. |
+| RQM-21 | Insurance Risk Rating and Actuarial Support | Package consequence outputs, annualized losses, hazard metrics, asset characteristics, uncertainty measures, and supporting metadata for insurance and actuarial applications. | Support insurance risk rating, actuarial analysis, portfolio risk assessment, model validation, and comparison against observed loss experience. |
+
+## Personas
+
+The following personas represent the primary roles associated with the user stories.
+
+| Persona | Description | RQM # |
+| --- | --- | --- |
+| GIS Analyst | Manages spatial asset inventories and geometries. | 01, 11, 12 |
+| Data Prep Lead | Integrates and prepares data for risk analysis. | 04, 06, 07 |
+| Data Steward | Maintains asset identity, version control, provenance, and access requirements. | 02, 03, 16, 19 |
+| Data Engineer | Designs relational schemas, extensible data models, and interoperable exports. | 05, 10, 13, 17, 18 |
+| Consequences Analyst | Evaluates damage and loss, calculates risk metrics, and quantifies uncertainty. | 08, 09, 15 |
+| Hazard Analyst | Analyzes hazard results and probability distributions. | 14 |
+| Benefit-Cost Analyst | Quantifies mitigation benefits and costs. | 20 |
+| NFIP Actuary | Evaluates flood risk and loss estimates to support insurance rating. | 21 |

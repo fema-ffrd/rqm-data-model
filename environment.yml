@@ -1,0 +1,41 @@
+name: rqm-base
+channels:
+  - conda-forge
+dependencies:
+  - python=3.12
+  - numpy
+  - pandas
+  - scipy
+  - openpyxl
+  - geopandas
+  - shapely
+  - rasterio
+  - pyproj
+  - matplotlib
+  - notebook
+  - ipykernel
+  - pip
+  - pyarrow
+  - pytest
+  - pyyaml
+  - pyspark=4.1.*
+  - requests
+  - rioxarray
+  - ruff
+  - xarray
+  - zarr
+  - pip:
+    - pystac
+    - nbconvert
+    - leafmap
+    - python-dotenv
+    - stac_geoparquet
+    # Must match the Sedona JAR (sedona-spark-shaded-4.1_2.13) in tools/ingest_nsi.py.
+    - "apache-sedona[spark]==1.9.1"
+# Spark JARs are resolved from Maven via spark.jars.packages in tools/ingest_nsi.py,
+# not installed by conda/pip. Pinned there:
+#   org.apache.sedona:sedona-spark-shaded-4.1_2.13:1.9.1
+#   org.datasyslab:geotools-wrapper:1.9.1-33.5
+#   org.apache.iceberg:iceberg-spark-runtime-4.1_2.13:1.12.0
+# Spark 4.1 + Iceberg >= 1.12 is required for native Iceberg v3 GEOMETRY columns;
+# Spark 4.x requires Java 17+.

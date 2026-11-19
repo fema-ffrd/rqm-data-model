@@ -1,189 +1,133 @@
 %% =====================================================================
-%% Risk Quantification Methodology (RQM) Data Model — Entity Relationship Diagram
-%% Six domains, three storage tiers.
-%%   PostgreSQL : inventory, distribution specs, results metadata, provenance
-%%   Iceberg    : ensemble-scale realization draws & aggregates
-%%   Icechunk   : gridded hazard fields (referenced by URI)
+%% Risk Quantification Methodology (RQM) Data Model — NSI-Minimal ERD
+%% Iceberg v3 tables in namespace rqm.inventory. Apache Sedona is the query engine.
+%% -
+%% buildings  : one row per structure per source inventory, on the NSI
+%%              field set (every NSI parquet column maps 1:1). Sources sit
+%%              side by side, scoped by source_ref (ADR-multi-source).
+%% sources    : registry of loaded inventories (NSI, assessor rolls, ...).
+%% geometries : first-class multi-geometry attach (ADR-geometry preserved).
+%%              Point for role='point', Polygon/MultiPolygon for role='footprint'.
+%%              Every load creates one computation point per building;
+%%              polygon sources also add a display footprint.
+%% -
+%% inventory_versions : version registry. Each version_name is also an Iceberg
+%%                      tag on buildings + geometries (ADR-versioning).
+%% inventory_changes  : per-building change log of each version vs. its parent.
+%% -
+%% The previous 35-table hybrid ERD is preserved at diagrams/rqm-erd-full.mmd.
+%% Deferred domains (uncertainty, hazard, DDF, loss realizations, exports,
+%% provenance, valid-time history) and their re-entry points are documented
+%% in docs/decisions/ADR-nsi-minimal.md.
 %% =====================================================================
 erDiagram
 
-  %% ---------- DOMAIN A: INVENTORY (PostgreSQL) ----------
   buildings {
-    bigint building_id PK
-    bigint fd_id
-    geometry geom
-    varchar occupancy_type
-    smallint number_stories
-    double building_cost
-    double content_cost
-    double inventory_cost
-    varchar census_block
-    bigint inventory_version_id FK
-  }
-  building_components {
-    bigint component_id PK
-    bigint building_id FK
-    varchar component_type
-    bigint generic_id FK
-    double replacement_cost
-  }
-  generics {
-    bigint generic_id PK
-    varchar category
-    varchar subtype
-    varchar schema_ref
-  }
-
-  %% ---------- DOMAIN B: ATTRIBUTE UNCERTAINTY (PostgreSQL) ----------
-  attribute_distributions {
-    bigint dist_id PK
-    bigint building_id FK
-    bigint component_id FK
-    varchar attribute_name
-    varchar dist_family
-    jsonb parameters
-    jsonb conditioning
-    bigint version_id FK
-  }
-  foundation_pmf {
-    bigint pmf_id PK
-    bigint building_id FK
-    varchar foundation_class
-    real probability
-    varchar shuffle_policy
-    bigint version_id FK
-  }
-
-  %% ---------- DOMAIN C: HAZARD LINKAGE (PostgreSQL -> Icechunk) ----------
-  events {
-    bigint event_id PK
-    varchar event_name
-    varchar peril_type
-    real aep
-    real return_period
-    varchar source
-    bigint version_id FK
-  }
-  hazard_links {
-    bigint hazard_link_id PK
-    bigint building_id FK
-    bigint event_id FK
-    real aep
-    varchar peril_type
-    varchar depth_grid_uri
-    varchar depth_dist_family
-    jsonb depth_parameters
-    varchar grid_version
+    bigint      building_id PK "NSI: fd_id; else hash(source_ref, source_record_id)"
+    varchar     source_ref FK
+    varchar     source_record_id
+    bigint      fd_id
+    varchar     bid
+    varchar     usastrucid
+    varchar     ftprntid
+    varchar     ftprntsrc
+    varchar     source
+    varchar     occtype
+    varchar     st_damcat
+    varchar     bldgtype
+    smallint    num_story
+    double      sqft
+    double      ftprntsqft
+    real        bldheight
+    smallint    med_yr_blt
+    varchar     found_type
+    real        found_ht
+    double      val_struct
+    double      val_cont
+    double      val_vehic
+    double      ornl_low
+    double      ornl_med
+    double      ornl_hgh
+    real        resunits
+    real        novehprob
+    real        vehperunit
+    real        pop2amu65
+    real        pop2amo65
+    real        pop2pmu65
+    real        pop2pmo65
+    real        u65disable
+    real        o65disable
+    real        students
+    varchar     firmzone
+    varchar     zone_sub
+    real        static_bfe
+    real        ground_elv
+    real        grnd_elv_m
+    real        pctlowclr
+    real        fullrep
+    real        depindex
+    real        creprcnt
+    real        crerank
+    varchar     cbfips
+    double      x
+    double      y
+    timestamp   ingested_at
   }
 
-  %% ---------- DOMAIN D: DEPTH-DAMAGE FUNCTIONS (PostgreSQL) ----------
-  ddf_library {
-    bigint ddf_id PK
-    varchar ddf_code
-    varchar ddf_kind
-    varchar peril_type
-    varchar occupancy_type
-    varchar foundation_class
-    bigint version_id FK
-  }
-  ddf_uncertainty {
-    bigint ddf_unc_id PK
-    bigint ddf_id FK
-    real depth_ft
-    real damage_mean
-    real damage_p10
-    real damage_p50
-    real damage_p90
+  geometries {
+    bigint      geometry_id PK
+    bigint      building_id FK
+    varchar     role
+    varchar     purpose
+    boolean     is_selected_for_export
+    varchar     alt_group_key
+    varchar     source_ref
+    varchar     crs
+    geometry    geom
+    timestamp   ingested_at
   }
 
-  %% ---------- DOMAIN E: REALIZATION & LOSS RESULTS (Iceberg) ----------
-  loss_realizations {
-    bigint realization_id
-    bigint building_id
-    bigint run_id
-    bigint event_id
-    real aep
-    bigint seed
-    real depth_in_structure
-    varchar foundation_type
-    real first_floor_height
-    real ddf_percentile
-    double building_loss
-    double content_loss
-    double total_loss
-  }
-  mv_loss_summary {
-    bigint summary_id
-    varchar agg_level
-    varchar agg_key
-    real aep
-    double loss_mean
-    double loss_p90
-    double loss_p95
-    double aal
-    bigint run_id
+  sources {
+    varchar     source_ref PK
+    varchar     source_name
+    varchar     source_kind
+    varchar     description
+    varchar     spec_sha256
+    timestamp   updated_at
   }
 
-  %% ---------- DOMAIN F: PROVENANCE & VERSIONING (PostgreSQL) ----------
-  run_catalog {
-    bigint run_id PK
-    bigint event_id
-    bigint manifest_id FK
-    varchar run_type
-    varchar status
-    integer n_realizations
-  }
-  manifests {
-    bigint manifest_id PK
-    varchar engine_version
-    varchar ddf_library_version
-    varchar dist_ruleset_version
-    jsonb config
-  }
-  run_logs {
-    bigint log_id PK
-    bigint run_id FK
-    varchar log_uri
-  }
-  versioning {
-    bigint version_id PK
-    varchar entity_type
-    varchar entity_ref
-    varchar semver
-    bigint parent_version_id FK
+  inventory_versions {
+    varchar     version_name PK "= Iceberg tag"
+    varchar     parent_version FK
+    varchar     merged_version FK
+    varchar     branch
+    varchar     kind
+    varchar     source_ref FK
+    varchar     source_uri
+    varchar     source_sha256
+    varchar     editor
+    varchar     reason
+    bigint      buildings_snapshot_id
+    bigint      geometries_snapshot_id
+    bigint      n_buildings
+    bigint      n_added
+    bigint      n_removed
+    bigint      n_changed
+    timestamp   created_at
   }
 
-  %% ---------------- RELATIONSHIPS ----------------
-  %% Inventory
-  buildings              ||--o{ building_components     : "decomposes into"
-  generics               ||--o{ building_components     : "typed by"
-  versioning             ||--o{ buildings               : "versions"
+  inventory_changes {
+    varchar     version_name PK,FK
+    bigint      building_id PK,FK
+    varchar     change_kind
+    varchar[]   changed_columns
+  }
 
-  %% Attribute uncertainty
-  buildings              ||--o{ attribute_distributions : "has uncertain attrs"
-  building_components     ||--o{ attribute_distributions : "scoped to"
-  buildings              ||--o{ foundation_pmf          : "shuffled foundation"
-  versioning             ||--o{ attribute_distributions : "versions"
-  versioning             ||--o{ foundation_pmf          : "versions"
-
-  %% Hazard linkage
-  buildings              ||--o{ hazard_links            : "exposed to depth"
-  events                 ||--o{ hazard_links            : "scenario for"
-  versioning             ||--o{ events                  : "versions"
-
-  %% DDF
-  ddf_library            ||--o{ ddf_uncertainty         : "percentile envelope"
-  versioning             ||--o{ ddf_library             : "versions"
-
-  %% Results (logical FKs across tiers)
-  buildings              ||--o{ loss_realizations       : "loss draws"
-  run_catalog            ||--o{ loss_realizations       : "produces"
-  ddf_library            ||--o{ loss_realizations       : "applied DDF"
-  loss_realizations      }o--|| mv_loss_summary         : "aggregated into"
-
-  %% Provenance
-  manifests              ||--o{ run_catalog             : "config for"
-  events                 ||--o{ run_catalog             : "executed in"
-  run_catalog            ||--o{ run_logs                : "logs"
-  run_catalog            ||--o{ mv_loss_summary         : "summarized by"
-  versioning             |o--o{ versioning              : "lineage parent"
+  sources ||--o{ buildings : "supplies"
+  sources |o--o{ inventory_versions : "loaded by release"
+  buildings ||--o{ geometries : "has 1..N representations"
+  inventory_versions ||--o{ inventory_changes : "records changes vs. parent"
+  buildings ||--o{ inventory_changes : "changed in"
+  inventory_versions |o--o{ inventory_versions : "parent / merged"
+  inventory_versions ||..|{ buildings : "tags a snapshot of"
+  inventory_versions ||..|{ geometries : "tags a snapshot of"
