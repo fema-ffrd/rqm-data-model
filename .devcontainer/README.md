@@ -1,19 +1,32 @@
-# Devcontainer Template
-Devcontainers allow interactive development inside of a docker container using VSCode. 
+# Devcontainer setup
 
+The devcontainer provides interactive development in a Linux Docker container
+from VS Code. This repository's root `environment.yml` defines the Python
+environment used by the container.
 
-This devcontainer creates a reproducible environment for python projects using micromamba    
-environments (faster/more robust version of conda). To add this devcontainer template to your project, copy this .devcontainer folder  
-into the parent directory of your repository, and copy this [.gitattributes file](https://github.com/Michael-Baker-International-Lakewood/mbi_templates/blob/main/.gitattributes) into the same parent directory.
+## Start Docker Desktop on Windows
 
-When opening this repository in VSCode, you may be prompted to re-open the project in devcontainer.  
-Alternatively, you may access this option through the  
-View menu -> Command Palette -> DevContainers: Reopen in Container.
+Before opening the repository in the devcontainer:
 
-Other requirements:
-1. An environment file (env.yaml) is required placed in the root folder of the  
-project for a reproducible python environment to be succussfully built.
-2. docker installed on the local machine (linux)
+1. Start Docker Desktop from the Windows Start menu and wait for the status in
+   the bottom-left corner to show **Engine running**. Docker Desktop must be
+   running before VS Code can build or start the container.
+2. In Docker Desktop, open **Settings** and verify that **Choose Virtual
+   Machine Manager (VMM)** is set to **WSL 2**. In the screenshot below, this
+   setting appears in the lower half of the **General** settings page. Apply
+   the setting if you changed it.
+
+![Docker Desktop showing the Engine running status and WSL 2 selected as the VMM](docker_desktop.png)
+
+## Open the repository in the devcontainer
+
+Open the repository folder in VS Code. If prompted, choose to reopen it in the
+devcontainer. Otherwise, open the Command Palette and run **Dev Containers:
+Reopen in Container**. On the first build, VS Code creates the container and
+the `rqm-base` environment from `environment.yml`.
+
+Keep `environment.yml` and the `.devcontainer` configuration in the
+repository so VS Code can build the container and its environment.
 
 ## Large data (`RQM_DATA_DIR`)
 

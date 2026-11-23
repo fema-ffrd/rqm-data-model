@@ -72,7 +72,7 @@ rqm-data-model/
 │   ├── data-dictionary-full.yaml  # archived hybrid exploration (reference only)
 │   ├── data-dictionary-full.md    # archived generated output
 │   ├── preview_dict.py            # validates + renders the Markdown
-│   └── requirements.txt           # generator deps (PyYAML)
+│   └── requirements.txt           # optional pip deps; devcontainer uses environment.yml
 ├── diagrams/
 │   ├── rqm-erd.mmd                # Mermaid ERD (NSI-minimal)
 │   ├── rqm-erd-full.mmd           # archived hybrid ERD (reference only)
@@ -100,7 +100,7 @@ rqm-data-model/
 │   ├── versioning.py              # versions, diffs, history, branches, merges, exports
 │   ├── rqm_version.py             # CLI: list / diff / history / branch / export / sources / check
 │   ├── schema.sql                 # DDL for the rqm.inventory namespace (5 tables)
-│   └── requirements.txt           # PySpark, Sedona, Iceberg, pyarrow, shapely, pytest
+│   └── requirements.txt           # optional pip deps; devcontainer uses environment.yml
 ├── test/
 │   ├── conftest.py                # session-scoped Spark + ingest fixture
 │   ├── test_nsi_ingest.py         # smoke tests (ADR validation rules)
@@ -115,12 +115,34 @@ rqm-data-model/
 └── LICENSE
 ```
 
+## Environment Requirements
+- Windows Subsystem for Linux (WSL)
+
+```powershell
+wsl --install
+```
+- DockerDesktop: https://docs.docker.com/desktop/setup/install/windows-install/
+- VSCode: https://code.visualstudio.com/download
+
+
+## Environment setup
+
+The devcontainer creates the `rqm-base` environment from the repository-root
+`environment.yml`. For a manually created environment in a Linux container,
+run these commands from the repository root in Bash:
+
+```bash
+conda env create -f environment.yml
+conda activate rqm-base
+```
+
+The following commands assume the `rqm-base` environment is active.
+
 ## Regenerating the data dictionary
 
 The YAML is authoritative; the Markdown is generated.
 
-```powershell
-pip install -r data-dictionary/requirements.txt
+```bash
 python data-dictionary/preview_dict.py
 ```
 
@@ -134,8 +156,7 @@ OK: validated 5 tables, 86 columns. Wrote data-dictionary.md.
 
 Requires Java 17+ on PATH for PySpark 4.1.
 
-```powershell
-pip install -r tools/requirements.txt
+```bash
 python tools/ingest_nsi.py --parquet test/data/nsi.parquet --warehouse test/warehouse \
     --version nsi-sample-v1 --editor "$USER" --reason "initial load"
 pytest test -v
