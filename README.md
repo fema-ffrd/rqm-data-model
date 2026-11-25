@@ -30,13 +30,16 @@ Primary and foreign keys are logical (Iceberg does not enforce them). The ingest
 
 ## Data model
 
-Three inventory tables plus two versioning tables, all in the Iceberg namespace `inventory` (`rqm.inventory.<table>`). See [data-dictionary/data-dictionary.md](data-dictionary/data-dictionary.md) for the generated field reference and [diagrams/rqm-erd.mmd](diagrams/rqm-erd.mmd) for the ERD.
+Six inventory tables plus two versioning tables, all in the Iceberg namespace `inventory` (`rqm.inventory.<table>`). See [data-dictionary/data-dictionary.md](data-dictionary/data-dictionary.md) for the generated field reference and [diagrams/rqm-erd.mmd](diagrams/rqm-erd.mmd) for the ERD.
 
 | Table | Purpose | Rows per load |
 |---|---|---|
 | `buildings` | One row per structure per source on the NSI field set (all 46 NSI parquet columns mapped 1:1), plus `source_ref` / `source_record_id` | one per structure in the source |
 | `geometries` | First-class geometry registry (point + optional footprints + alternates) | one `role='point'` row per structure; polygon sources add a `role='footprint'` row |
-| `sources` | Registry of loaded inventories: `source_ref`, name, kind, spec hash | one per source (upserted) |
+| `sources` | Registry of loaded inventories: `source_ref`, name, kind, spec hash, sidecar schema | one per source (upserted) |
+| `source_specs` | Immutable registry of every mapping spec used, as canonical JSON keyed by its SHA-256 | one per distinct spec |
+| `source_attributes` | Source fields with no `buildings` column, carried through from the spec's `sidecar:` block (`MAP<STRING, STRING>`) | at most one per structure of a source with a sidecar |
+| `building_lineage` | Which version and which exact spec produced each building | one per structure |
 | `inventory_versions` | Version registry: name (= Iceberg tag), parent, branch, source loaded, editor, reason, source hash, snapshot ids, change counts | one per committed version |
 | `inventory_changes` | Per-building change log of each version relative to its parent | one per building added / removed / modified |
 
@@ -44,8 +47,9 @@ Three inventory tables plus two versioning tables, all in the Iceberg namespace 
 
 - **`buildings`** is the flat inventory projection. NSI field names (`occtype`, `num_story`, `val_struct`, `pop2amu65`, `firmzone`, `cbfips`, …) are preserved verbatim so queries line up with the raw parquet. `building_id` is the primary key: the NSI `fd_id` for NSI rows, and a negative hash of `(source_ref, source_record_id)` for other sources, so ids are stable across re-ingests. The table is partitioned by state (`truncate(2, cbfips)`) and sorted by `cbfips`.
 - **`geometries`** carries one row per `(building, representation, alternate)` tuple. The NSI load creates exactly one row per structure with `role='point'`, `purpose='computation'`, `is_selected_for_export=true`, `crs='EPSG:3857'`, and `geom` holding the NSI `shape` point as a native Iceberg v3 `GEOMETRY(3857)`. `geometry_id` is the xxhash64 of the row's natural key `(source_ref, building_id, role, purpose, alt_group_key)`, so it is stable across re-ingests. Sedona queries read it via `ST_GeomFromWKB(spark_st_asbinary(geom))` (see `sedona_geom_sql()` in `tools/ingest_nsi.py`). Later, a footprint load (MSBF or USAS) writes additional rows with `role='footprint'`; a selection migration flips `is_selected_for_export` as needed.
-- **Versions** ([ADR-versioning](docs/decisions/ADR-versioning.md)). Loads are full-replacement `MERGE` upserts, so a modified dataset updates only the rows that changed, and merge-on-read writes keep the storage cost to those rows. Committing a load or an edit creates a named **version**: an Iceberg tag of that name on `buildings` and `geometries`, a row in `inventory_versions` (who, when, why, source file), and per-building rows in `inventory_changes`. Every version stays queryable with `VERSION AS OF '<version>'`. Project inventories are Iceberg **branches**. They merge back by fast-forward, or by a building-level three-way merge that refuses conflicting edits. `export_version` writes a version plus a `_rqm_version.json` manifest that pins its snapshots.
+- **Versions** ([ADR-versioning](docs/decisions/ADR-versioning.md)). Loads are full-replacement `MERGE` upserts, so a modified dataset updates only the rows that changed, and merge-on-read writes keep the storage cost to those rows. Committing a load or an edit creates a named **version**: an Iceberg tag of that name on `buildings`, `geometries`, `source_attributes`, and `building_lineage`, a row in `inventory_versions` (who, when, why, source file), and per-building rows in `inventory_changes`. Every version stays queryable with `VERSION AS OF '<version>'`. Project inventories are Iceberg **branches**. They merge back by fast-forward, or by a building-level three-way merge that refuses conflicting edits. `export_version` writes a version plus a `_rqm_version.json` manifest that pins its snapshots.
 - **Sources** ([ADR-multi-source](docs/decisions/ADR-multi-source.md)). Every row carries the `source_ref` of the inventory it came from, registered in `sources`. A load is a `MERGE` that fully replaces only its own source's rows, so NSI, an assessor roll, and a field survey coexist. The same structure can appear once per source, so aggregates should select sources explicitly.
+- **Sidecar attributes and lineage** ([ADR-source-sidecar-attributes](docs/decisions/ADR-source-sidecar-attributes.md)). A spec's `sidecar:` block keeps source fields that have no `buildings` column (e.g. a portfolio's premium or policy term) in `source_attributes`, keyed by `building_id`. `building_lineage` records, per building, the version and the spec (by its canonical hash, stored in `source_specs`) of the last load that changed it — a reload rewrites only the lineage of buildings it changed — so `tools/sidecar.py` `source_of(building_id, 'val_struct')` answers which source column produced a value from the warehouse alone.
 - **Enums** for `occtype`, `st_damcat`, `found_type`, `geometry_role`, and `geometry_purpose` are inlined in the YAML rather than normalized into lookup tables. NSI already publishes stable short codes; a lookup table adds nothing until per-code metadata (RSMeans rates, fragility curves) is actually needed, and adding one later is additive.
 
 ### Deferred concepts (re-entry map)
@@ -57,7 +61,7 @@ Each deferred concept has a concrete re-entry point on this schema so reintroduc
 - **Hazard links + events** → FK on `buildings.building_id`; events standalone.
 - **DDF library + DDF uncertainty** → keyed on `occtype` + `found_type` enums.
 - **Loss realizations** → Iceberg table keyed on `building_id` + `event_id` + `realization_id`.
-- **Provenance registry (PROV-O)** → partly resolved by [ADR-multi-source](docs/decisions/ADR-multi-source.md) (`sources` registry plus `buildings.source_ref`); per-value provenance and restricted sources remain deferred ([ADR-restricted-sources](docs/decisions/ADR-restricted-sources.md), proposed).
+- **Provenance registry (PROV-O)** → partly resolved by [ADR-multi-source](docs/decisions/ADR-multi-source.md) (`sources` registry plus `buildings.source_ref`) and [ADR-source-sidecar-attributes](docs/decisions/ADR-source-sidecar-attributes.md) (per-building spec and version lineage); per-value provenance and restricted sources remain deferred ([ADR-restricted-sources](docs/decisions/ADR-restricted-sources.md), proposed).
 - **Bitemporal identity + branching** → resolved by [ADR-versioning](docs/decisions/ADR-versioning.md) (Iceberg tags and branches plus a version registry); valid time is still deferred.
 - **Export contracts** → separate `exports` domain.
 - **3D geometry roles + component-level geometry** → extend `geometries.role` enum; add optional `component_id` FK.
@@ -82,6 +86,7 @@ rqm-data-model/
 │   │   ├── ADR-nsi-minimal.md     # the decision behind this edition
 │   │   ├── ADR-versioning.md      # versions, branches, merges, pinned exports
 │   │   ├── ADR-multi-source.md    # side-by-side inventories, YAML source specs
+│   │   ├── ADR-source-sidecar-attributes.md  # sidecar fields, lineage, spec registry
 │   │   └── ADR-restricted-sources.md  # proposed: restricted-source handling
 │   ├── plans/                     # implementation plans
 │   ├── user-stories/
@@ -98,15 +103,17 @@ rqm-data-model/
 │   ├── sources/nsi.yaml           # built-in NSI spec (identity mapping)
 │   ├── synthetic_sources.py       # deterministic demo sources from the NSI sample
 │   ├── versioning.py              # versions, diffs, history, branches, merges, exports
-│   ├── rqm_version.py             # CLI: list / diff / history / branch / export / sources / check
-│   ├── schema.sql                 # DDL for the rqm.inventory namespace (5 tables)
+│   ├── sidecar.py                 # read helpers: sidecar attributes, lineage, source_of
+│   ├── rqm_version.py             # CLI: list / diff / history / branch / export / sources / specs / check
+│   ├── schema.sql                 # DDL for the rqm.inventory namespace (8 tables)
 │   └── requirements.txt           # optional pip deps; devcontainer uses environment.yml
 ├── test/
 │   ├── conftest.py                # session-scoped Spark + ingest fixture
 │   ├── test_nsi_ingest.py         # smoke tests (ADR validation rules)
 │   ├── test_versioning.py         # versions, diffs, branches, merges, exports
 │   ├── test_sources.py            # source spec validation (no Spark)
-│   ├── test_multi_source.py       # side-by-side loads, scoped reloads, migration
+│   ├── test_multi_source.py       # side-by-side loads, scoped reloads, sidecar + lineage, migration
+│   ├── test_sidecar.py            # sidecar / lineage read helpers
 │   ├── test_spark_settings.py     # unit tests for session/catalog/layout config
 │   └── data/
 │       ├── nsi.parquet            # sample NSI extract (46 cols, ~45k rows)

@@ -6,13 +6,18 @@
 %%              field set (every NSI parquet column maps 1:1). Sources sit
 %%              side by side, scoped by source_ref (ADR-multi-source).
 %% sources    : registry of loaded inventories (NSI, assessor rolls, ...).
+%% source_specs      : immutable registry of mapping specs by canonical hash.
+%% source_attributes : source fields with no buildings column (sidecar: block).
+%% building_lineage  : version + spec that produced each building
+%%                     (ADR-source-sidecar-attributes).
 %% geometries : first-class multi-geometry attach (ADR-geometry preserved).
 %%              Point for role='point', Polygon/MultiPolygon for role='footprint'.
 %%              Every load creates one computation point per building;
 %%              polygon sources also add a display footprint.
 %% -
 %% inventory_versions : version registry. Each version_name is also an Iceberg
-%%                      tag on buildings + geometries (ADR-versioning).
+%%                      tag on buildings, geometries, source_attributes, and
+%%                      building_lineage (ADR-versioning).
 %% inventory_changes  : per-building change log of each version vs. its parent.
 %% -
 %% The previous 35-table hybrid ERD is preserved at diagrams/rqm-erd-full.mmd.
@@ -92,8 +97,34 @@ erDiagram
     varchar     source_name
     varchar     source_kind
     varchar     description
-    varchar     spec_sha256
+    varchar     spec_sha256 FK
     timestamp   updated_at
+    map         sidecar_schema "key -> declared type"
+  }
+
+  source_specs {
+    varchar     spec_sha256 PK "sha256 of spec_document"
+    varchar     source_ref FK
+    varchar     spec_uri
+    text        spec_document "canonical JSON"
+    timestamp   registered_at
+  }
+
+  source_attributes {
+    bigint      building_id PK,FK
+    varchar     source_ref FK
+    varchar     source_record_id
+    map         attributes "key -> value as text"
+    timestamp   ingested_at
+  }
+
+  building_lineage {
+    bigint      building_id PK,FK
+    varchar     source_ref FK
+    varchar     source_record_id
+    varchar     source_version_name FK
+    varchar     spec_sha256 FK
+    timestamp   ingested_at
   }
 
   inventory_versions {
@@ -109,6 +140,8 @@ erDiagram
     varchar     reason
     bigint      buildings_snapshot_id
     bigint      geometries_snapshot_id
+    bigint      source_attributes_snapshot_id
+    bigint      building_lineage_snapshot_id
     bigint      n_buildings
     bigint      n_added
     bigint      n_removed
@@ -125,9 +158,16 @@ erDiagram
 
   sources ||--o{ buildings : "supplies"
   sources |o--o{ inventory_versions : "loaded by release"
-  buildings ||--o{ geometries : "has 1..N representations"
+  buildings ||--|{ geometries : "has 1..N representations"
   inventory_versions ||--o{ inventory_changes : "records changes vs. parent"
   buildings ||--o{ inventory_changes : "changed in"
   inventory_versions |o--o{ inventory_versions : "parent / merged"
   inventory_versions ||..|{ buildings : "tags a snapshot of"
   inventory_versions ||..|{ geometries : "tags a snapshot of"
+  sources ||--o{ source_specs : "authored for"
+  buildings ||--o| source_attributes : "extra source fields"
+  buildings ||--o| building_lineage : "produced by"
+  source_specs ||--o{ building_lineage : "mapped by"
+  inventory_versions |o--o{ building_lineage : "loaded in"
+  inventory_versions ||..|{ source_attributes : "tags a snapshot of"
+  inventory_versions ||..|{ building_lineage : "tags a snapshot of"

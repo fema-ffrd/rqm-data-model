@@ -3,7 +3,8 @@
 Usage
 -----
     python tools/rqm_version.py --warehouse WH list
-    python tools/rqm_version.py --warehouse WH diff nsi-2024 nsi-2025 [--show 20]
+    python tools/rqm_version.py --warehouse WH diff nsi-2024 nsi-2025 [--show 20] \
+        [--include-sidecar] [--include-lineage]
     python tools/rqm_version.py --warehouse WH history 120262564
     python tools/rqm_version.py --warehouse WH branch list
     python tools/rqm_version.py --warehouse WH branch create calibration --from nsi-2025
@@ -11,9 +12,12 @@ Usage
         --version nsi-2025-cal --editor jdoe --reason "found_ht survey"
     python tools/rqm_version.py --warehouse WH branch drop calibration
     python tools/rqm_version.py --warehouse WH export nsi-2025 out/ [--where SQL] \
-        [--source NSI --source COUNTY-ASSESSOR]
+        [--source NSI --source COUNTY-ASSESSOR] [--no-include-sidecar] \
+        [--no-include-lineage]
     python tools/rqm_version.py --warehouse WH sources list
     python tools/rqm_version.py --warehouse WH sources show COUNTY-ASSESSOR
+    python tools/rqm_version.py --warehouse WH specs list [--source REF]
+    python tools/rqm_version.py --warehouse WH specs show <spec_sha256 or prefix>
     python tools/rqm_version.py --warehouse WH check
 
 Versions are created by loading data: `ingest_nsi.py --version NAME` or
@@ -55,6 +59,16 @@ def _parser() -> argparse.ArgumentParser:
     diff.add_argument(
         "--show", type=int, default=20, help="Changed buildings to print (default 20)."
     )
+    diff.add_argument(
+        "--include-sidecar",
+        action="store_true",
+        help="Also diff source_attributes (changed attribute keys per building).",
+    )
+    diff.add_argument(
+        "--include-lineage",
+        action="store_true",
+        help="Also diff building_lineage (spec / version / record id changes).",
+    )
 
     history = sub.add_parser("history", help="Versions that changed one building.")
     history.add_argument("building_id", type=int)
@@ -91,6 +105,19 @@ def _parser() -> argparse.ArgumentParser:
         metavar="REF",
         help="Export only this source's buildings; repeatable (default: all sources).",
     )
+    export.add_argument(
+        "--include-sidecar",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Write _source_attributes.parquet (default: when an exported source "
+        "declares a sidecar).",
+    )
+    export.add_argument(
+        "--include-lineage",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Write _building_lineage.parquet and _source_specs.json (default: yes).",
+    )
 
     sources = sub.add_parser(
         "sources", help="Registered building sources."
@@ -98,6 +125,14 @@ def _parser() -> argparse.ArgumentParser:
     sources.add_parser("list", help="List sources with their building count on main.")
     show = sources.add_parser("show", help="One source: registry row and history.")
     show.add_argument("source_ref")
+
+    specs = sub.add_parser(
+        "specs", help="Registered mapping specs (source_specs)."
+    ).add_subparsers(dest="specs_command", required=True)
+    specs_list = specs.add_parser("list", help="List registered specs.")
+    specs_list.add_argument("--source", default=None, metavar="REF")
+    spec_show = specs.add_parser("show", help="Print one registered spec.")
+    spec_show.add_argument("sha", help="spec_sha256 or a unique prefix of it.")
 
     sub.add_parser("check", help="Check registry, tags, change log, and invariants.")
     return ap
@@ -113,12 +148,26 @@ def main(argv: list[str] | None = None) -> int:
         apply_schema(spark, cat, namespace=ns)
         if args.command == "list":
             v.list_versions(spark, cat, ns).drop(
-                "source_uri", "buildings_snapshot_id", "geometries_snapshot_id"
+                "source_uri", *[f"{t}_snapshot_id" for t in v.VERSIONED_TABLES]
             ).show(100, truncate=40)
         elif args.command == "diff":
             diff = v.diff_versions(spark, cat, args.old, args.new, ns).cache()
             print(json.dumps(v.diff_summary(diff), indent=2))
             diff.orderBy("change_kind", "building_id").show(args.show, truncate=False)
+            for table, wanted in (
+                ("source_attributes", args.include_sidecar),
+                ("building_lineage", args.include_lineage),
+            ):
+                if not wanted:
+                    continue
+                changes = v.diff_sidecar_versions(
+                    spark, cat, args.old, args.new, table, ns
+                ).cache()
+                print(f"{table}:")
+                print(json.dumps(v.diff_summary(changes), indent=2))
+                changes.orderBy("change_kind", "building_id").show(
+                    args.show, truncate=False
+                )
         elif args.command == "history":
             v.building_history(spark, cat, args.building_id, ns).show(100, truncate=40)
         elif args.command == "branch":
@@ -160,11 +209,15 @@ def main(argv: list[str] | None = None) -> int:
                 args.out_dir,
                 where=args.where,
                 sources=args.sources,
+                include_sidecar=args.include_sidecar,
+                include_lineage=args.include_lineage,
                 namespace=ns,
             )
             print(json.dumps(manifest, indent=2))
         elif args.command == "sources":
             return _sources_command(spark, args)
+        elif args.command == "specs":
+            return _specs_command(spark, args)
         elif args.command == "check":
             problems = v.check_consistency(spark, cat, ns)
             for problem in problems:
@@ -200,7 +253,13 @@ def _sources_command(spark, args: argparse.Namespace) -> int:
         print(f"error: {err.args[0]}", file=sys.stderr)
         return 1
     print(json.dumps(row.asDict(), indent=2, default=str))
-    print("\nVersions that loaded this source:")
+    print("\nSpecs registered for this source (rqm_version.py specs show <sha>):")
+    spark.table(table_name(cat, "source_specs", ns)).where(
+        F.col("source_ref") == args.source_ref
+    ).select("spec_sha256", "spec_uri", "registered_at").orderBy("registered_at").show(
+        100, truncate=False
+    )
+    print("Versions that loaded this source:")
     v.list_versions(spark, cat, ns).where(
         F.col("source_ref") == args.source_ref
     ).select(
@@ -210,6 +269,32 @@ def _sources_command(spark, args: argparse.Namespace) -> int:
     v.source_counts(spark, cat, ns).where(F.col("source_ref") == args.source_ref).drop(
         "source_ref"
     ).show(100, truncate=False)
+    return 0
+
+
+def _specs_command(spark, args: argparse.Namespace) -> int:
+    from ingest_nsi import table_name
+    from pyspark.sql import functions as F
+
+    specs = spark.table(table_name(args.catalog, "source_specs", args.namespace))
+    if args.specs_command == "list":
+        if args.source:
+            specs = specs.where(F.col("source_ref") == args.source)
+        specs.select("spec_sha256", "source_ref", "spec_uri", "registered_at").orderBy(
+            "source_ref", "registered_at"
+        ).show(100, truncate=False)
+        return 0
+    rows = specs.where(F.col("spec_sha256").startswith(args.sha)).collect()
+    if len(rows) != 1:
+        found = "no" if not rows else f"{len(rows)}"
+        print(f"error: {found} specs match {args.sha!r}", file=sys.stderr)
+        return 1
+    row = rows[0]
+    print(
+        f"spec_sha256: {row['spec_sha256']}\nsource_ref: {row['source_ref']}\n"
+        f"spec_uri: {row['spec_uri']}\nregistered_at: {row['registered_at']}\n"
+    )
+    print(json.dumps(json.loads(row["spec_document"]), indent=2))
     return 0
 
 

@@ -122,6 +122,48 @@ TBLPROPERTIES (
 );
 
 -- -----------------------------------------------------------------------------
+-- source_attributes: source-native fields with no buildings column, carried
+-- through verbatim from the spec's `sidecar:` block
+-- (ADR-source-sidecar-attributes). At most one row per building, keyed like
+-- buildings and written by the same scoped load; versioned (tagged and
+-- branched) with buildings.
+-- -----------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS rqm.inventory.source_attributes (
+    building_id      BIGINT    NOT NULL COMMENT 'PK; FK -> buildings.building_id (1:1, at most one sidecar row per building).',
+    source_ref       STRING    NOT NULL COMMENT 'FK -> sources.source_ref; equals buildings.source_ref of the same building.',
+    source_record_id STRING             COMMENT 'Native id of the structure in its source, denormalized from buildings.',
+    attributes       MAP<STRING, STRING> NOT NULL COMMENT 'Sidecar output key -> CAST(source value AS STRING); keys whose source value is NULL are omitted. Declared types: sources.sidecar_schema.',
+    ingested_at      TIMESTAMP NOT NULL COMMENT 'When this row was last written.'
+) USING iceberg
+TBLPROPERTIES (
+    'format-version'    = '3',
+    'write.delete.mode' = 'merge-on-read',
+    'write.update.mode' = 'merge-on-read',
+    'write.merge.mode'  = 'merge-on-read'
+);
+
+-- -----------------------------------------------------------------------------
+-- building_lineage: which load and which exact spec produced each building's
+-- buildings columns (ADR-source-sidecar-attributes). One row per building,
+-- naming the last load that added or changed it: a reload rewrites only the
+-- rows of buildings whose values it changed. Versioned with buildings.
+-- -----------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS rqm.inventory.building_lineage (
+    building_id         BIGINT    NOT NULL COMMENT 'PK; FK -> buildings.building_id (1:1).',
+    source_ref          STRING    NOT NULL COMMENT 'FK -> sources.source_ref; equals buildings.source_ref of the same building.',
+    source_record_id    STRING             COMMENT 'Native id of the structure in its source, denormalized from buildings.',
+    source_version_name STRING             COMMENT 'FK -> inventory_versions.version_name: the version of the last load that added or changed this building. NULL until the load is committed (commit_version fills it in).',
+    spec_sha256         STRING    NOT NULL COMMENT 'FK -> source_specs.spec_sha256: the spec of the last load that added or changed this building (its fields block produced the buildings columns).',
+    ingested_at         TIMESTAMP NOT NULL COMMENT 'When this row was last written.'
+) USING iceberg
+TBLPROPERTIES (
+    'format-version'    = '3',
+    'write.delete.mode' = 'merge-on-read',
+    'write.update.mode' = 'merge-on-read',
+    'write.merge.mode'  = 'merge-on-read'
+);
+
+-- -----------------------------------------------------------------------------
 -- sources: registry of the inventories loaded into buildings (ADR-multi-source).
 -- Upserted from the source's YAML spec on every load, on main only (never
 -- branched), and never deleted, so every version's source_ref values resolve.
@@ -131,19 +173,36 @@ CREATE TABLE IF NOT EXISTS rqm.inventory.sources (
     source_name  STRING    NOT NULL COMMENT 'Human-readable name.',
     source_kind  STRING    NOT NULL COMMENT 'Enum source_kind: national_inventory | local_inventory | commercial_inventory | project_inventory | field_survey | remote_sensing | other.',
     description  STRING             COMMENT 'Free text.',
-    spec_sha256  STRING             COMMENT 'SHA-256 of the YAML mapping spec last used to load the source.',
-    updated_at   TIMESTAMP NOT NULL COMMENT 'When this row was last written.'
+    spec_sha256  STRING             COMMENT 'FK -> source_specs.spec_sha256: canonical SHA-256 of the YAML mapping spec last used to load the source (rows written before ADR-source-sidecar-attributes hold the file hash until the source is reloaded).',
+    updated_at   TIMESTAMP NOT NULL COMMENT 'When this row was last written.',
+    sidecar_schema MAP<STRING, STRING> COMMENT 'Sidecar output key -> declared type from the spec (source_attributes). NULL if the source has no sidecar.'
+) USING iceberg
+TBLPROPERTIES ('format-version' = '3');
+
+-- -----------------------------------------------------------------------------
+-- source_specs: immutable registry of every mapping spec a load has used
+-- (ADR-source-sidecar-attributes). Append-only, on main only (never
+-- branched or tagged), and never deleted, so every building_lineage row at
+-- any version resolves its spec. sha2(spec_document, 256) = spec_sha256.
+-- -----------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS rqm.inventory.source_specs (
+    spec_sha256   STRING    NOT NULL COMMENT 'PK; SHA-256 of spec_document (the canonical JSON of the spec).',
+    source_ref    STRING    NOT NULL COMMENT 'FK -> sources.source_ref: the source the spec was authored for.',
+    spec_uri      STRING             COMMENT 'Where the authored YAML lived when first registered (repo-relative path or absolute path). Informational; spec_document is authoritative.',
+    spec_document STRING    NOT NULL COMMENT 'Canonical JSON of the spec: keys sorted recursively, compact separators (tools/sources.py canonical_document).',
+    registered_at TIMESTAMP NOT NULL COMMENT 'First time this spec_sha256 was seen.'
 ) USING iceberg
 TBLPROPERTIES ('format-version' = '3');
 
 -- -----------------------------------------------------------------------------
 -- inventory_versions: version registry. One row per named inventory version.
--- The version name is also an Iceberg tag on buildings and geometries pointing
--- at the recorded snapshots. The row is written last, so a version exists only
+-- The version name is also an Iceberg tag on every versioned table
+-- (buildings, geometries, source_attributes, building_lineage) pointing at
+-- the recorded snapshots. The row is written last, so a version exists only
 -- once it is registered; tags without a row are leftovers of a failed commit.
 -- -----------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS rqm.inventory.inventory_versions (
-    version_name           STRING    NOT NULL COMMENT 'PK; also the Iceberg tag name on buildings and geometries.',
+    version_name           STRING    NOT NULL COMMENT 'PK; also the Iceberg tag name on every versioned table.',
     parent_version         STRING             COMMENT 'Version this one was derived from (NULL for a root load); for merges, the previous version on the target branch.',
     merged_version         STRING             COMMENT 'For kind=merge: the branch version merged in.',
     branch                 STRING    NOT NULL COMMENT 'Iceberg branch the version was committed on (main or a project branch).',
@@ -155,6 +214,8 @@ CREATE TABLE IF NOT EXISTS rqm.inventory.inventory_versions (
     reason                 STRING             COMMENT 'Why the version was committed.',
     buildings_snapshot_id  BIGINT    NOT NULL COMMENT 'Iceberg snapshot of buildings tagged with version_name.',
     geometries_snapshot_id BIGINT    NOT NULL COMMENT 'Iceberg snapshot of geometries tagged with version_name.',
+    source_attributes_snapshot_id BIGINT COMMENT 'Iceberg snapshot of source_attributes tagged with version_name (versions older than the table point at its empty root snapshot).',
+    building_lineage_snapshot_id  BIGINT COMMENT 'Iceberg snapshot of building_lineage tagged with version_name (versions older than the table point at its empty root snapshot).',
     n_buildings            BIGINT    NOT NULL COMMENT 'Buildings in the version.',
     n_added                BIGINT    NOT NULL COMMENT 'Buildings added relative to parent_version (all of them for a root).',
     n_removed              BIGINT    NOT NULL COMMENT 'Buildings removed relative to parent_version.',

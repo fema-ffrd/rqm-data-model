@@ -32,7 +32,8 @@ YAML source mapping specs (ADR-multi-source) for the synthetic inventories that
 
 - `county-assessor.yaml`: `COUNTY-ASSESSOR`, GeoPackage parcel polygons in EPSG:2276;
 - `field-survey-2025.yaml`: `FIELD-SURVEY-2025`, CSV with lon / lat;
-- `project-riverbend.yaml`: `PROJECT-RIVERBEND`, parquet with WKB points in EPSG:3857.
+- `project-riverbend.yaml`: `PROJECT-RIVERBEND`, parquet with WKB points in EPSG:3857;
+- `milliman-2026q1.yaml`: `MILLIMAN-2026Q1`, parquet with lon / lat and a `sidecar:` block that keeps the portfolio's underwriting fields in `source_attributes` (ADR-source-sidecar-attributes).
 
 They are used by `test/test_sources.py`, `test/test_multi_source.py`, and
 `notebooks/03_multi_source_demo.ipynb`. The built-in NSI spec lives with the

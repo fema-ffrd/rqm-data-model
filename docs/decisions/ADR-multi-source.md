@@ -4,6 +4,7 @@
 **Status:** Accepted
 **Date:** 2026-11-11
 **Builds on:** [ADR-nsi-minimal](ADR-nsi-minimal.md) (amends validation rule 7), [ADR-versioning](ADR-versioning.md)
+**Amended by:** [ADR-source-sidecar-attributes](ADR-source-sidecar-attributes.md) (§1 lineage, §3 `spec_sha256` / `sidecar_schema`, §4 `sidecar:` block)
 **Serves user stories:** RQM-04 (national, local, commercial, or project-specific inventories; keep each source's native identifier)
 **Implementation:** `tools/schema.sql`, `tools/sources.py`, `tools/sources/nsi.yaml`, `tools/ingest_source.py`, `tools/ingest_nsi.py`, `tools/versioning.py`, `tools/rqm_version.py`
 **Tests / demo:** `test/test_sources.py`, `test/test_multi_source.py`, `notebooks/03_multi_source_demo.ipynb` (synthetic sources from `tools/synthetic_sources.py`, specs in `test/data/sources/`)
@@ -31,6 +32,7 @@ RQM-04 asks for inventories from national, local, commercial, and project-specif
 - **Collision guard.** Before writing, a load refuses any hashed id that collides with a different `(source_ref, source_record_id)` (`assert_no_building_id_collisions`, mirroring the `geometry_id` guard).
 - **Stable across releases.** A `source_ref` names a dataset *lineage* (`COUNTY-ASSESSOR`), not a release, and stays the same across releases. The release label goes in the version name and `inventory_versions.source_uri`. So a structure keeps its `building_id` across reloads, and diffs between releases show modifications rather than delete-plus-insert (RQM-02).
 - **Who may use native ids.** Only the built-in NSI spec may use native ids. Every other spec gets hashed ids, and `NSI` is a reserved `source_ref`.
+- **Lineage.** Since [ADR-source-sidecar-attributes](ADR-source-sidecar-attributes.md), `building_lineage` records per `building_id` the version of the last load that changed it and the exact spec (`source_specs.spec_sha256`) that mapped its columns.
 
 ### 2. Scoped loads
 
@@ -66,8 +68,9 @@ WHEN NOT MATCHED BY SOURCE AND t.source_ref = '<source>' THEN DELETE
 | `source_name` | Human-readable name |
 | `source_kind` | Enum `source_kind`: `national_inventory`, `local_inventory`, `commercial_inventory`, `project_inventory`, `field_survey`, `remote_sensing`, `other` |
 | `description` | Free text |
-| `spec_sha256` | SHA-256 of the YAML spec last used to load the source |
+| `spec_sha256` | SHA-256 of the YAML spec last used to load the source; since ADR-source-sidecar-attributes the hash of its canonical JSON, registered in `source_specs` |
 | `updated_at` | When the row was last written |
+| `sidecar_schema` | Sidecar key → declared type (ADR-source-sidecar-attributes); NULL without a `sidecar:` block |
 
 The registry row is upserted from the spec on every load, before the data `MERGE`s, so a building never references an unregistered source. It is written on `main` and never branched, and rows are never deleted, so every version's `source_ref`s resolve. `inventory_versions.source_ref` records which source a release loaded; it is NULL for edits and merges.
 
@@ -118,6 +121,8 @@ fields:
 **Reported, not refused:**
 - Crosswalk gaps: input codes no `map` covers (`crosswalk_gaps`).
 - Rows without `cbfips`, which land in the NULL-state partition of `buildings`.
+
+**Sidecar fields.** Since [ADR-source-sidecar-attributes](ADR-source-sidecar-attributes.md), an optional top-level `sidecar: {fields: {key: {from: COL, type: T}}}` block carries source fields that have no `buildings` column through into `source_attributes`. Sidecar keys may not collide with `buildings` columns.
 
 **NSI is a source like any other.** `tools/sources/nsi.yaml` is the built-in identity mapping (native `fd_id` ids, `subcode: source`). `ingest_nsi.load_buildings` / `load_geometries` keep their signatures and NSI behavior and delegate to the generic engine with it.
 

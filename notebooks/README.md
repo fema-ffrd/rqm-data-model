@@ -6,7 +6,7 @@ The three demos form a series and share one Iceberg warehouse, `test/warehouse-n
 
 1. `01_setup_demo.ipynb` deletes and recreates the warehouse, loads the NSI sample, and commits it as version `nsi-sample-v1`.
 2. `02_versioning_demo.ipynb` starts from `nsi-sample-v1` and leaves `main` at `nsi-sample-v7`.
-3. `03_multi_source_demo.ipynb` starts from `nsi-sample-v7` and adds the other sources, ending at `riverbend-merged`.
+3. `03_multi_source_demo.ipynb` starts from `nsi-sample-v7` and adds the other sources, ending at `milliman-r2`.
 
 Each of 02 and 03 checks first that `main` is exactly at the version it expects, and stops with a message naming the notebook to run if not. To run the series again, start over from 01. Every notebook keeps its own inputs and exports in its own folder under `test/` (all gitignored).
 
@@ -35,7 +35,8 @@ Walkthrough of multi-source inventories ([ADR-multi-source](../docs/decisions/AD
 
 - a county assessor roll: GeoPackage parcel polygons in EPSG:2276 with land-use codes, first-floor elevation in inches, text foundation types, and `PARCEL_ID` ids;
 - a field survey: CSV with lon / lat and a sparse mapping;
-- a planned development: parquet with WKB points.
+- a planned development: parquet with WKB points;
+- a commercial insurance portfolio (Milliman-shaped): parquet with lon / lat and underwriting fields that have no `buildings` column.
 
 Their mapping specs are in [`test/data/sources/`](../test/data/sources/). The notebook covers:
 
@@ -45,6 +46,7 @@ Their mapping specs are in [`test/data/sources/`](../test/data/sources/). The no
 - a scoped reload of the assessor's second release (`assessor-r2`) whose diff touches only assessor rows;
 - loading the project inventory on a `riverbend` branch (`riverbend-plan`) and fast-forward merging it (`riverbend-merged`);
 - a pinned export filtered to NSI + assessor, with its manifest;
+- sidecar attributes and lineage ([ADR-source-sidecar-attributes](../docs/decisions/ADR-source-sidecar-attributes.md)): loading the portfolio (`milliman-r1`) with its underwriting fields in `source_attributes`, querying them, tracing `val_struct` back to its source column and spec, and reloading release 2 with a changed spec (`milliman-r2`);
 - `check_consistency` over every version.
 
-It runs in about two minutes. The inventory lives in the shared warehouse; the notebook's own inputs and exports are recreated on each run under `test/multi-source-notebook/` (`inputs/`, `exports/`). The committed copy was executed with `jupyter nbconvert --to notebook --execute --inplace notebooks/03_multi_source_demo.ipynb`, right after 01 and 02.
+It runs in about three minutes. The inventory lives in the shared warehouse; the notebook's own inputs and exports are recreated on each run under `test/multi-source-notebook/` (`inputs/`, `exports/`). The committed copy was executed with `jupyter nbconvert --to notebook --execute --inplace notebooks/03_multi_source_demo.ipynb`, right after 01 and 02.

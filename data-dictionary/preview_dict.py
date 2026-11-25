@@ -77,7 +77,10 @@ def render(model):
         "ADR-nsi-minimal. Inventory versions, branches, and the per-building "
         "change log follow ADR-versioning. Other building inventories load "
         "side by side with NSI, scoped by `source_ref` and registered in "
-        "`sources`, per ADR-multi-source. The previous full-coverage "
+        "`sources`, per ADR-multi-source. Source fields with no `buildings` "
+        "column, and the load and spec behind each building, live in "
+        "`source_attributes`, `building_lineage`, and `source_specs` per "
+        "ADR-source-sidecar-attributes. The previous full-coverage "
         "dictionary is preserved at `data-dictionary-full.yaml`.\n"
     )
 

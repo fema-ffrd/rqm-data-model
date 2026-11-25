@@ -22,18 +22,24 @@
 #              (rqm.inventory.<table>).
 #
 # Versioning (ADR-versioning): named inventory versions are Iceberg tags on
-# buildings + geometries, registered in inventory_versions, with per-building
+# buildings + geometries (and the sidecar tables source_attributes +
+# building_lineage), registered in inventory_versions, with per-building
 # changes in inventory_changes. Project inventories are Iceberg branches.
 #
 # Multiple sources (ADR-multi-source): NSI and other inventories (assessor
 # rolls, field surveys, project inventories, ...) sit side by side in
 # buildings, scoped by source_ref and registered in sources. The NSI field
 # set is the shared column schema; each source maps onto it with a YAML spec.
+#
+# Sidecar attributes and lineage (ADR-source-sidecar-attributes): source
+# fields with no buildings column are carried through into
+# source_attributes; building_lineage records which load and which spec
+# (registered by its canonical hash in source_specs) produced each building.
 # =============================================================================
 
 metadata:
   model_name: Risk Quantification Methodology (RQM) Data Model — NSI Minimal
-  version: 0.4.0
+  version: 0.5.0
   companion_repo: fema-ffrd/inland-consequences
   storage_tiers: [iceberg]
   query_engine: Apache Sedona (Spark 4.1)
@@ -239,6 +245,54 @@ tables:
       - {name: geom,                   type: geometry,     nullable: false, description: 'Native Iceberg v3 GEOMETRY(EPSG:3857); Point for role=''point'', Polygon/MultiPolygon for role=''footprint''. Sedona reads it via ST_GeomFromWKB(spark_st_asbinary(geom)).'}
       - {name: ingested_at,            type: timestamp,    nullable: false, description: 'When this row was last written (insert, or a load that changed its point or CRS).'}
 
+  source_attributes:
+    domain: inventory
+    storage: iceberg
+    grain: At most one row per building (buildings with at least one sidecar value).
+    description: >
+      Source-native fields that have no buildings column (e.g. a portfolio's
+      policy term, agent, premium, construction class), carried through
+      verbatim from the spec's `sidecar:` block (ADR-source-sidecar-attributes).
+      Keyed by buildings.building_id and written by the same scoped load as
+      buildings: a reload upserts the source's rows and deletes rows of its
+      buildings that are gone or have no sidecar value left; other sources
+      are never touched. A spec without a sidecar block writes no rows.
+      Versioned and branched with buildings (same tag per version); a commit
+      deletes rows whose building an edit removed. Physical layout:
+      partitioned by source_ref, sorted by building_id; merge-on-read
+      writes.
+    columns:
+      - {name: building_id,      type: bigint,      pk: true, fk: buildings.building_id, nullable: false, description: The building (1:1).}
+      - {name: source_ref,       type: varchar(64), fk: sources.source_ref, nullable: false, description: Equals buildings.source_ref of the same building.}
+      - {name: source_record_id, type: text,        nullable: true,  description: Native id of the structure in its source, denormalized from buildings.}
+      - {name: attributes,       type: 'map<varchar, varchar>', nullable: false, description: 'Sidecar output key -> CAST(source value AS STRING). A NULL source value leaves the key out (present means the source had a value). Read typed with the declared type in sources.sidecar_schema, e.g. CAST(attributes[''premium_usd''] AS DOUBLE).'}
+      - {name: ingested_at,      type: timestamp,   nullable: false, description: When the row was last written (insert, or a load that changed it).}
+
+  building_lineage:
+    domain: inventory
+    storage: iceberg
+    grain: One row per building.
+    description: >
+      Canonical-field lineage (ADR-source-sidecar-attributes): which load
+      (version) and which exact mapping spec produced each building's
+      buildings columns. Follow spec_sha256 to source_specs and read the
+      spec's `fields` rule for a column (from / expr / map / default) to
+      learn which source column populated it (tools/sidecar.py source_of).
+      Points at the last load that added or changed the building: a reload
+      rewrites only the rows of buildings whose buildings columns it changed
+      (compared against the pre-load snapshot), so a new spec reaches only
+      the buildings whose values it changes; edits do not rewrite it. Versioned
+      and branched with buildings; a commit deletes rows whose building an
+      edit removed. Physical layout: partitioned by source_ref, sorted by
+      building_id; merge-on-read writes.
+    columns:
+      - {name: building_id,         type: bigint,       pk: true, fk: buildings.building_id, nullable: false, description: The building (1:1).}
+      - {name: source_ref,          type: varchar(64),  fk: sources.source_ref, nullable: false, description: Equals buildings.source_ref of the same building.}
+      - {name: source_record_id,    type: text,         nullable: true,  description: Native id of the structure in its source, denormalized from buildings.}
+      - {name: source_version_name, type: varchar(100), fk: inventory_versions.version_name, nullable: true, description: 'Version of the last load that added or changed the building. A load given its version records it directly; otherwise the next commit on the branch fills it in. Migration backfill: the last NSI release in the branch history that added or modified the building (inventory_changes), else the root NSI release.'}
+      - {name: spec_sha256,         type: varchar(64),  fk: source_specs.spec_sha256, nullable: false, description: The spec of the last load that added or changed the building; its fields block produced the buildings columns.}
+      - {name: ingested_at,         type: timestamp,    nullable: false, description: When the row was last written.}
+
   sources:
     domain: inventory
     storage: iceberg
@@ -257,8 +311,31 @@ tables:
       - {name: source_name, type: varchar(200), nullable: false, description: Human-readable name.}
       - {name: source_kind, type: varchar(32),  nullable: false, description: 'Enum source_kind: national_inventory, local_inventory, commercial_inventory, project_inventory, field_survey, remote_sensing, or other.'}
       - {name: description, type: text,         nullable: true,  description: Free text.}
-      - {name: spec_sha256, type: varchar(64),  nullable: true,  description: SHA-256 of the YAML mapping spec last used to load the source.}
+      - {name: spec_sha256, type: varchar(64),  fk: source_specs.spec_sha256, nullable: true,  description: 'Canonical SHA-256 of the mapping spec last used to load the source (ADR-source-sidecar-attributes). Rows written before that migration hold the spec file''s hash until the source is reloaded.'}
       - {name: updated_at,  type: timestamp,    nullable: false, description: When the row was last written.}
+      - {name: sidecar_schema, type: 'map<varchar, varchar>', nullable: true, description: 'Sidecar output key -> declared type (string, double, bigint, boolean, timestamp, date) from the spec''s sidecar block; NULL if the source carries no sidecar fields.'}
+
+  source_specs:
+    domain: inventory
+    storage: iceberg
+    grain: One row per distinct mapping spec (by canonical hash).
+    description: >
+      Immutable registry of every YAML mapping spec a load has used
+      (ADR-source-sidecar-attributes). A spec is identified by spec_sha256,
+      the SHA-256 of its canonical JSON (keys sorted recursively, compact
+      separators), so reformatting the YAML keeps the hash and any semantic
+      change gives a new row. The canonical document itself is stored, so
+      "which source column produced buildings.val_struct for this
+      building?" is answerable from the warehouse alone (building_lineage ->
+      source_specs). Append-only, on main only (not versioned or branched),
+      never deleted. sha2(spec_document, 256) = spec_sha256 is checked by
+      versioning.check_consistency.
+    columns:
+      - {name: spec_sha256,   type: varchar(64),  pk: true, nullable: false, description: SHA-256 of spec_document.}
+      - {name: source_ref,    type: varchar(64),  fk: sources.source_ref, nullable: false, description: Source the spec was authored for.}
+      - {name: spec_uri,      type: text,         nullable: true,  description: 'Where the authored YAML lived when first registered (repo-relative or absolute path). Informational; spec_document is authoritative.'}
+      - {name: spec_document, type: text,         nullable: false, description: Canonical JSON of the spec (tools/sources.py canonical_document).}
+      - {name: registered_at, type: timestamp,    nullable: false, description: First time the spec was seen.}
 
   inventory_versions:
     domain: inventory
@@ -266,8 +343,9 @@ tables:
     grain: One row per named inventory version.
     description: >
       Version registry (ADR-versioning). Each row names an immutable state of
-      the inventory: `version_name` is also an Iceberg tag on `buildings` and
-      `geometries` pointing at the recorded snapshots, so the version reads as
+      the inventory: `version_name` is also an Iceberg tag on `buildings`,
+      `geometries`, `source_attributes`, and `building_lineage` pointing at
+      the recorded snapshots, so the version reads as
       `SELECT … FROM rqm.inventory.buildings VERSION AS OF '<version_name>'`.
       Records who committed it, why, from which input, on which branch, its
       lineage (parent and merged versions), and change counts relative to the
@@ -286,6 +364,8 @@ tables:
       - {name: reason,                 type: text,         nullable: true,  description: Why the version was committed (RQM-16).}
       - {name: buildings_snapshot_id,  type: bigint,       nullable: false, description: Iceberg snapshot of buildings tagged with version_name.}
       - {name: geometries_snapshot_id, type: bigint,       nullable: false, description: Iceberg snapshot of geometries tagged with version_name.}
+      - {name: source_attributes_snapshot_id, type: bigint, nullable: true, description: 'Iceberg snapshot of source_attributes tagged with version_name. Versions committed before the table existed point at its empty root snapshot (filled in by the schema migration).'}
+      - {name: building_lineage_snapshot_id,  type: bigint, nullable: true, description: 'Iceberg snapshot of building_lineage tagged with version_name (versions older than the table: its empty root snapshot).'}
       - {name: n_buildings,            type: bigint,       nullable: false, description: Buildings in the version.}
       - {name: n_added,                type: bigint,       nullable: false, description: Buildings added relative to parent_version (all of them for a root version).}
       - {name: n_removed,              type: bigint,       nullable: false, description: Buildings removed relative to parent_version.}

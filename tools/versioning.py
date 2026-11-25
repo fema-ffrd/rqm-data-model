@@ -2,8 +2,10 @@
 
 A *version* is a named, immutable state of the inventory:
 
-- an Iceberg **tag** of the same name on `buildings` and `geometries`,
-  pointing at one snapshot of each table;
+- an Iceberg **tag** of the same name on every versioned table
+  (`VERSIONED_TABLES`: `buildings`, `geometries`, and the sidecar tables
+  `source_attributes` and `building_lineage` of
+  ADR-source-sidecar-attributes), pointing at one snapshot of each table;
 - one row in `inventory_versions` (who, when, why, source file, snapshot ids,
   change counts), written last, so a version exists only once registered;
 - per-building rows in `inventory_changes` describing what changed relative
@@ -17,10 +19,13 @@ readable with `VERSION AS OF '<version>'`. Several sources sit side by side
 in the same tables (ADR-multi-source); diffs, merges, and branches key on
 `building_id` and work across them unchanged.
 
-Project inventories are Iceberg **branches** of the same name on both tables,
-created from a version. A branch is merged back by fast-forward when the
-target has not moved, otherwise by a building-level three-way merge that
-refuses to proceed when both sides touched the same building.
+Project inventories are Iceberg **branches** of the same name on every
+versioned table, created from a version. A branch is merged back by
+fast-forward when the target has not moved, otherwise by a building-level
+three-way merge that refuses to proceed when both sides touched the same
+building. The sidecar tables follow their buildings: a commit deletes
+sidecar rows of buildings that are gone, and a merge replays the branch's
+sidecar changes except for buildings the target changed.
 
 Exports pin a version: `export_version` writes the data read at the
 version's snapshots plus a `_rqm_version.json` manifest naming them.
@@ -55,10 +60,32 @@ from ingest_source import get_source
 from pyspark.sql import DataFrame, Row, SparkSession
 from pyspark.sql import functions as F
 
-# Tables whose state a version pins; each gets a tag named after the version.
-VERSIONED_TABLES: tuple[str, ...] = ("buildings", "geometries")
+# Tables whose state a version pins; each gets a tag named after the version
+# and every branch. The sidecar tables (ADR-source-sidecar-attributes) are
+# keyed by building_id and follow the buildings rows they describe.
+CORE_TABLES: tuple[str, ...] = ("buildings", "geometries")
+SIDECAR_TABLES: tuple[str, ...] = ("source_attributes", "building_lineage")
+VERSIONED_TABLES: tuple[str, ...] = (*CORE_TABLES, *SIDECAR_TABLES)
 VERSION_KINDS: tuple[str, ...] = ("release", "edit", "merge")
 CHANGE_KINDS: tuple[str, ...] = ("added", "removed", "modified")
+
+# Columns of the sidecar tables, and the ones a diff or merge compares
+# (`attributes_json` is the comparable form of the `attributes` map).
+SIDECAR_COLUMNS: dict[str, tuple[str, ...]] = {
+    "source_attributes": (
+        "building_id", "source_ref", "source_record_id", "attributes", "ingested_at",
+    ),
+    "building_lineage": (
+        "building_id", "source_ref", "source_record_id", "source_version_name",
+        "spec_sha256", "ingested_at",
+    ),
+}  # fmt: skip
+SIDECAR_COMPARE_COLUMNS: dict[str, tuple[str, ...]] = {
+    "source_attributes": ("source_ref", "source_record_id", "attributes_json"),
+    "building_lineage": (
+        "source_ref", "source_record_id", "source_version_name", "spec_sha256",
+    ),
+}  # fmt: skip
 
 # Geometry row columns compared by a merge; `geom` is compared as WKB.
 GEOMETRY_COLUMNS: tuple[str, ...] = (
@@ -89,6 +116,13 @@ GEOMETRY_COMPARE_COLUMNS: list[str] = [
 DIFF_COLUMNS: list[str] = [*BUILDING_COMPARE_COLUMNS, "geom"]
 
 MANIFEST_NAME = "_rqm_version.json"
+# Sidecar files of an export; `_`-prefixed so Spark, pandas, and pyarrow
+# readers of the export directory skip them, like the manifest.
+SIDECAR_EXPORTS: dict[str, str] = {
+    "source_attributes": "_source_attributes.parquet",
+    "building_lineage": "_building_lineage.parquet",
+    "source_specs": "_source_specs.json",
+}
 
 # Sphere radius of EPSG:3857 (Web Mercator), for converting moved points.
 WEB_MERCATOR_RADIUS_M = 6378137.0
@@ -264,12 +298,13 @@ def version_at(
     namespace: str = NAMESPACE,
 ) -> str | None:
     """The latest registered version pinned exactly to `snapshots`, if any."""
+    pinned = F.lit(True)
+    for table in VERSIONED_TABLES:
+        if table in snapshots:
+            pinned &= F.col(f"{table}_snapshot_id") == snapshots[table]
     rows = (
         _registry(spark, catalog, namespace)
-        .where(
-            (F.col("buildings_snapshot_id") == snapshots["buildings"])
-            & (F.col("geometries_snapshot_id") == snapshots["geometries"])
-        )
+        .where(pinned)
         .orderBy(F.col("created_at").desc())
         .limit(1)
         .collect()
@@ -281,7 +316,7 @@ def table_at(
     spark: SparkSession,
     catalog: str,
     table: str,
-    snapshot_id: int,
+    snapshot_id: int | None,
     namespace: str = NAMESPACE,
 ) -> DataFrame:
     """`table` as of an Iceberg snapshot id.
@@ -289,11 +324,13 @@ def table_at(
     Iceberg reads a snapshot with the schema it was written with, so
     `buildings` snapshots from before the multi-source migration lack
     `source_ref` / `source_record_id`; they are conformed to the current
-    columns (`ingest_nsi.conform_buildings`).
+    columns (`ingest_nsi.conform_buildings`). A `snapshot_id` of None reads
+    as the empty table.
     """
-    df = spark.sql(
-        f"SELECT * FROM {_fq(catalog, table, namespace)} VERSION AS OF {int(snapshot_id)}"
-    )
+    fq = _fq(catalog, table, namespace)
+    if snapshot_id is None:
+        return spark.table(fq).limit(0)
+    df = spark.sql(f"SELECT * FROM {fq} VERSION AS OF {int(snapshot_id)}")
     return conform_buildings(df) if table == "buildings" else df
 
 
@@ -304,7 +341,7 @@ def read_version(
     table: str = "buildings",
     namespace: str = NAMESPACE,
 ) -> DataFrame:
-    """`table` (buildings or geometries) exactly as recorded for `version`.
+    """A versioned table (`VERSIONED_TABLES`) exactly as recorded for `version`.
 
     Equivalent to `SELECT * FROM <table> VERSION AS OF '<version>'`, but
     reads the snapshot id from the registry, so it only works for
@@ -419,6 +456,84 @@ def diff_versions(
     )
 
 
+def _comparable(table: str, df: DataFrame) -> DataFrame:
+    """Sidecar rows with the comparable columns of `SIDECAR_COMPARE_COLUMNS`."""
+    if table == "source_attributes":
+        return df.withColumn(
+            "attributes_json", F.to_json(F.array_sort(F.map_entries("attributes")))
+        )
+    return df
+
+
+def sidecar_changes(old: DataFrame, new: DataFrame, table: str) -> DataFrame:
+    """Rows of a sidecar table added, removed, or modified between two states.
+
+    Like `row_changes` keyed on `building_id`, plus `source_ref`. For
+    `source_attributes`, `changed_columns` of a modified row lists the
+    attribute keys whose value changed (or appeared, or went away) instead of
+    `attributes_json`.
+    """
+    columns = SIDECAR_COMPARE_COLUMNS[table]
+    changes = row_changes(
+        _comparable(table, old),
+        _comparable(table, new),
+        "building_id",
+        columns,
+        keep=["source_ref"],
+    )
+    if table != "source_attributes":
+        return changes
+    maps = old.select("building_id", F.col("attributes").alias("_old_map")).join(
+        new.select("building_id", F.col("attributes").alias("_new_map")),
+        "building_id",
+        "full_outer",
+    )
+    keys = F.array_union(
+        F.coalesce(F.map_keys("_old_map"), F.array().cast("array<string>")),
+        F.coalesce(F.map_keys("_new_map"), F.array().cast("array<string>")),
+    )
+    changed_keys = F.filter(
+        keys,
+        lambda k: (
+            ~F.try_element_at("_old_map", k).eqNullSafe(F.try_element_at("_new_map", k))
+        ),
+    )
+    other = F.filter(
+        F.coalesce(F.col("changed_columns"), F.array().cast("array<string>")),
+        lambda c: c != F.lit("attributes_json"),
+    )
+    return (
+        changes.join(maps, "building_id", "left")
+        .withColumn(
+            "changed_columns",
+            F.when(
+                F.col("change_kind") == "modified",
+                F.array_sort(F.array_union(other, F.array_sort(changed_keys))),
+            ),
+        )
+        .drop("_old_map", "_new_map")
+    )
+
+
+def diff_sidecar_versions(
+    spark: SparkSession,
+    catalog: str,
+    old_version: str,
+    new_version: str,
+    table: str,
+    namespace: str = NAMESPACE,
+) -> DataFrame:
+    """Per-building diff of a sidecar table (`source_attributes` or
+    `building_lineage`) between two versions (see `sidecar_changes`)."""
+    if table not in SIDECAR_TABLES:
+        raise ValueError(f"{table!r} is not one of {SIDECAR_TABLES}")
+    return sidecar_changes(
+        read_version(spark, catalog, old_version, table, namespace),
+        read_version(spark, catalog, new_version, table, namespace),
+        table,
+    )
+
+
 def diff_summary(diff: DataFrame) -> dict[str, dict[str, int]]:
     """Counts of a building-level diff: by change kind, and by changed column."""
     by_kind = {k: 0 for k in CHANGE_KINDS}
@@ -463,6 +578,220 @@ def compare_buildings(
 
 
 # ---------------------------------------------------------------------------
+# Sidecar tables (ADR-source-sidecar-attributes)
+# ---------------------------------------------------------------------------
+
+
+def root_snapshot(spark: SparkSession, table_fq: str) -> int | None:
+    """The first (parentless) snapshot of a table, or None if it has none."""
+    rows = spark.sql(
+        f"SELECT snapshot_id FROM {table_fq}.snapshots "
+        "WHERE parent_id IS NULL ORDER BY committed_at LIMIT 1"
+    ).collect()
+    return rows[0]["snapshot_id"] if rows else None
+
+
+def _refs(spark: SparkSession, table_fq: str, ref_type: str) -> set[str]:
+    return {
+        r["name"]
+        for r in spark.sql(
+            f"SELECT name FROM {table_fq}.refs WHERE type = '{ref_type}'"
+        ).collect()
+    }
+
+
+def settle_sidecars(
+    spark: SparkSession,
+    catalog: str,
+    branch: str = "main",
+    version: str | None = None,
+    namespace: str = NAMESPACE,
+) -> None:
+    """Make the sidecar tables on `branch` follow its buildings before a commit.
+
+    Deletes `source_attributes` / `building_lineage` rows whose building is
+    gone (an edit deleted it), and stamps with `version` the lineage rows
+    whose `source_version_name` is NULL (a load without a version) or not a
+    registered version (a load committed under another name, or never).
+    Writes nothing when there is nothing to do.
+    """
+    buildings = _fq(catalog, "buildings", namespace, branch)
+    for table in SIDECAR_TABLES:
+        fq = _fq(catalog, table, namespace, branch)
+        orphans = (
+            f"SELECT s.building_id FROM {fq} s "
+            f"LEFT ANTI JOIN {buildings} b ON s.building_id = b.building_id"
+        )
+        if spark.sql(orphans).limit(1).count():
+            spark.sql(
+                f"MERGE INTO {fq} t USING ({orphans}) o "
+                "ON t.building_id = o.building_id WHEN MATCHED THEN DELETE"
+            )
+    if version is None:
+        return
+    validate_ref_name(version, "version")
+    lineage = _fq(catalog, "building_lineage", namespace, branch)
+    # NULL, or a name that never got registered (a load given a version
+    # that was then committed under another name, or not at all).
+    unstamped = (
+        f"SELECT l.building_id FROM {lineage} l "
+        f"LEFT ANTI JOIN {_fq(catalog, 'inventory_versions', namespace)} v "
+        f"ON l.source_version_name = v.version_name "
+        f"WHERE NOT (l.source_version_name <=> '{version}')"
+    )
+    if spark.sql(unstamped).limit(1).count():
+        spark.sql(
+            f"MERGE INTO {lineage} t USING ({unstamped}) s "
+            "ON t.building_id = s.building_id "
+            f"WHEN MATCHED THEN UPDATE SET source_version_name = '{version}'"
+        )
+
+
+def _backfill_nsi_lineage(
+    spark: SparkSession, catalog: str, branches: list[str], namespace: str
+) -> int:
+    """Best-effort lineage of the NSI buildings already on each branch.
+
+    The NSI rows were loaded by the built-in spec, so they point at its
+    current hash (registered in `source_specs`). Their version is the last
+    NSI release (`source_ref` NSI, or NULL for releases committed before
+    multi-source support) in the branch's history that added or modified
+    the building according to `inventory_changes`; buildings no later
+    release changed point at the earliest such release (a root load, which
+    records no change rows), else NULL (stamped by the branch's next
+    commit). Other sources' specs are not in the warehouse, so their
+    buildings get lineage on their next load. Returns the rows written.
+    """
+    from ingest_source import register_source, register_spec
+    from sources import nsi_spec
+
+    spec = nsi_spec()
+    buildings_fq = _fq(catalog, "buildings", namespace)
+    releases = [
+        r
+        for r in _registry(spark, catalog, namespace).collect()
+        if r["kind"] == "release"
+        and (r["source_ref"] == NSI_SOURCE_REF or r["source_ref"] is None)
+    ]
+    written = 0
+    for branch in branches:
+        head = ref_snapshot_id(spark, buildings_fq, branch)
+        if head is None:
+            continue
+        rows = conform_buildings(
+            spark.table(_fq(catalog, "buildings", namespace, branch))
+        ).where(F.col("source_ref") == NSI_SOURCE_REF)
+        if not rows.limit(1).count():
+            continue
+        if not written:
+            register_spec(spark, spec, catalog, namespace)
+            register_source(spark, spec, catalog, namespace)
+        history = set(_ancestry(spark, buildings_fq, head))
+        in_history = [r for r in releases if r["buildings_snapshot_id"] in history]
+        first = (
+            min(in_history, key=lambda r: r["created_at"])["version_name"]
+            if in_history
+            else None
+        )
+        names = [r["version_name"] for r in in_history]
+        last_changed = (
+            spark.table(_fq(catalog, "inventory_changes", namespace))
+            .where(
+                F.col("version_name").isin(names)
+                & F.col("change_kind").isin("added", "modified")
+            )
+            .join(
+                _registry(spark, catalog, namespace).select(
+                    "version_name", "created_at"
+                ),
+                "version_name",
+            )
+            .groupBy("building_id")
+            .agg(F.max_by("version_name", "created_at").alias("_last_changed"))
+        )
+        lineage = rows.join(last_changed, "building_id", "left").select(
+            "building_id",
+            "source_ref",
+            "source_record_id",
+            F.coalesce("_last_changed", F.lit(first).cast("string")).alias(
+                "source_version_name"
+            ),
+            F.lit(spec.sha256).alias("spec_sha256"),
+            F.current_timestamp().alias("ingested_at"),
+        )
+        lineage.writeTo(_fq(catalog, "building_lineage", namespace, branch)).append()
+        written += lineage.count()
+    return written
+
+
+def prepare_sidecar_tables(
+    spark: SparkSession,
+    catalog: str,
+    namespace: str = NAMESPACE,
+    created: Iterable[str] = (),
+) -> None:
+    """Bring the versioned sidecar tables in line with buildings (idempotent).
+
+    Called by `ingest_nsi.apply_schema`. Each sidecar table gets an empty
+    root snapshot, every branch `buildings` has (created at the root), and a
+    tag for every registered version recorded before the table existed
+    (pointing at the root, with the snapshot id filled in the registry), so
+    every version and branch is defined on every versioned table. When
+    `building_lineage` is in `created` (just created in a warehouse that may
+    hold data), the lineage of NSI buildings is backfilled.
+    """
+    roots: dict[str, int] = {}
+    for table in SIDECAR_TABLES:
+        fq = _fq(catalog, table, namespace)
+        root = root_snapshot(spark, fq)
+        if root is None:
+            spark.sql(f"INSERT INTO {fq} SELECT * FROM {fq} WHERE false")
+            root = root_snapshot(spark, fq)
+        roots[table] = root
+
+    buildings_fq = _fq(catalog, "buildings", namespace)
+    branches = sorted(_refs(spark, buildings_fq, "BRANCH") - {"main"})
+    for table in SIDECAR_TABLES:
+        fq = _fq(catalog, table, namespace)
+        existing = _refs(spark, fq, "BRANCH") | _refs(spark, fq, "TAG")
+        for branch in branches:
+            if branch not in existing:
+                spark.sql(
+                    f"ALTER TABLE {fq} CREATE BRANCH `{branch}` "
+                    f"AS OF VERSION {roots[table]}"
+                )
+
+    if "building_lineage" in set(created):
+        _backfill_nsi_lineage(spark, catalog, ["main", *branches], namespace)
+
+    columns = {t: f"{t}_snapshot_id" for t in SIDECAR_TABLES}
+    missing = (
+        _registry(spark, catalog, namespace)
+        .where(" OR ".join(f"{c} IS NULL" for c in columns.values()))
+        .collect()
+    )
+    if not missing:
+        return
+    for row in missing:
+        validate_ref_name(row["version_name"], "version")
+        for table, column in columns.items():
+            if row[column] is None:
+                spark.sql(
+                    f"ALTER TABLE {_fq(catalog, table, namespace)} CREATE OR REPLACE "
+                    f"TAG `{row['version_name']}` AS OF VERSION {roots[table]}"
+                )
+    spark.sql(
+        f"UPDATE {_fq(catalog, 'inventory_versions', namespace)} SET "
+        + ", ".join(
+            f"{column} = coalesce({column}, {roots[table]})"
+            for table, column in columns.items()
+        )
+        + " WHERE "
+        + " OR ".join(f"{c} IS NULL" for c in columns.values())
+    )
+
+
+# ---------------------------------------------------------------------------
 # Committing versions
 # ---------------------------------------------------------------------------
 
@@ -488,11 +817,14 @@ def commit_version(
     `source_ref` names the source a release loaded (it must be registered in
     `sources`); leave it None for edits and merges.
 
-    Steps: resolve the parent (default: `nearest_version` of the branch
-    head), write the per-building changes relative to it into
-    `inventory_changes`, tag both tables, and finally insert the registry row.
-    A failure before the last step leaves no version; re-running the commit
-    replaces the partial tags and change rows.
+    Steps: settle the sidecar tables on the branch (`settle_sidecars`:
+    rows of buildings that are gone are deleted, lineage rows of loads not
+    yet committed are stamped with `version`), resolve the parent (default:
+    `nearest_version` of the branch head), write the per-building changes
+    relative to it into `inventory_changes`, tag every versioned table, and
+    finally insert the registry row. A failure before the last step leaves
+    no version; re-running the commit replaces the partial tags and change
+    rows.
 
     Returns the registry row as a dict.
     """
@@ -505,15 +837,18 @@ def commit_version(
         raise ValueError("editor is required (who is committing the version?)")
     ensure_version_available(spark, catalog, version, namespace)
 
-    head = head_snapshots(spark, catalog, branch, namespace)
-    if parent is None:
-        parent = nearest_version(spark, catalog, head, namespace)
-    else:
+    if parent is not None:
         get_version(spark, catalog, parent, namespace)
     if merged_version is not None:
         get_version(spark, catalog, merged_version, namespace)
     if source_ref is not None:
         get_source(spark, catalog, source_ref, namespace)
+    head_snapshots(spark, catalog, branch, namespace)  # the branch must exist
+    settle_sidecars(spark, catalog, branch, version, namespace)
+
+    head = head_snapshots(spark, catalog, branch, namespace)
+    if parent is None:
+        parent = nearest_version(spark, catalog, head, namespace)
 
     changes_fq = _fq(catalog, "inventory_changes", namespace)
     stale = spark.table(changes_fq).where(F.col("version_name") == version)
@@ -562,10 +897,12 @@ def commit_version(
             (version_name, parent_version, merged_version, branch, kind,
              source_ref, source_uri, source_sha256, editor, reason,
              buildings_snapshot_id, geometries_snapshot_id,
+             source_attributes_snapshot_id, building_lineage_snapshot_id,
              n_buildings, n_added, n_removed, n_changed, created_at)
         VALUES (:version_name, :parent_version, :merged_version, :branch, :kind,
                 :source_ref, :source_uri, :source_sha256, :editor, :reason,
                 :buildings_snapshot_id, :geometries_snapshot_id,
+                :source_attributes_snapshot_id, :building_lineage_snapshot_id,
                 :n_buildings, :n_added, :n_removed, :n_changed,
                 current_timestamp())
         """,
@@ -582,6 +919,8 @@ def commit_version(
             "reason": reason,
             "buildings_snapshot_id": head["buildings"],
             "geometries_snapshot_id": head["geometries"],
+            "source_attributes_snapshot_id": head["source_attributes"],
+            "building_lineage_snapshot_id": head["building_lineage"],
             "n_buildings": n_buildings,
             "n_added": counts["added"],
             "n_removed": counts["removed"],
@@ -650,7 +989,7 @@ def create_branch(
     from_version: str,
     namespace: str = NAMESPACE,
 ) -> dict[str, int]:
-    """Create Iceberg branch `branch` on both tables at `from_version`.
+    """Create Iceberg branch `branch` on every versioned table at `from_version`.
 
     Load into it with `ingest_nsi --branch`, or edit it directly through
     `table_name(catalog, table, namespace, branch)`, then `commit_version`
@@ -674,7 +1013,7 @@ def create_branch(
 def drop_branch(
     spark: SparkSession, catalog: str, branch: str, namespace: str = NAMESPACE
 ) -> None:
-    """Drop `branch` from both tables. Versions committed on it stay (tags)."""
+    """Drop `branch` from every versioned table. Versions committed on it stay (tags)."""
     validate_ref_name(branch, "branch")
     if branch == "main":
         raise ValueError("cannot drop 'main'")
@@ -837,12 +1176,14 @@ def merge_branch(
     """Merge `branch` into `into` and commit the result as `version`.
 
     The branch head must be a committed version. If `into` has not moved
-    since the branch diverged, both tables fast-forward. Otherwise the
+    since the branch diverged, every versioned table fast-forwards. Otherwise the
     changes since the common ancestor are compared building by building
     (attributes and every geometry row). A building changed on both sides is
     a conflict unless both sides ended in the same state; any conflict raises
     `MergeConflictError` and nothing is written. Otherwise the branch's
-    changes are replayed onto `into`.
+    changes are replayed onto `into`; sidecar rows (`source_attributes`,
+    `building_lineage`) follow, except for buildings `into` changed in any
+    versioned table, which keep the target's sidecar rows.
 
     The new version is `kind='merge'`, its parent is the previous version of
     `into`, `merged_version` is the branch version, and its changes are what
@@ -938,6 +1279,33 @@ def merge_branch(
             "geometry_id",
             GEOMETRY_COLUMNS,
         )
+        # Sidecar rows follow their buildings: the branch's changes are
+        # replayed except for buildings the target changed in any table
+        # (theirs win, for attributes and lineage together).
+        target_kept = dst_touched
+        for table in SIDECAR_TABLES:
+            target_kept = target_kept.union(
+                sidecar_changes(
+                    table_at(spark, catalog, table, base[table], namespace),
+                    table_at(spark, catalog, table, target[table], namespace),
+                    table,
+                ).select("building_id")
+            )
+        target_kept = target_kept.distinct()
+        for table in SIDECAR_TABLES:
+            changes = sidecar_changes(
+                table_at(spark, catalog, table, base[table], namespace),
+                table_at(spark, catalog, table, source[table], namespace),
+                table,
+            ).join(target_kept, "building_id", "left_anti")
+            _apply_row_changes(
+                spark,
+                changes,
+                table_at(spark, catalog, table, source[table], namespace),
+                _fq(catalog, table, namespace, into),
+                "building_id",
+                SIDECAR_COLUMNS[table],
+            )
 
     info = commit_version(
         spark,
@@ -972,6 +1340,13 @@ def check_inventory_invariants(
     the head of main; rows are never deleted). Rule 7 (`building_id =
     fd_id`) applies to NSI rows; every other row's `building_id` must equal
     the hash of (source_ref, source_record_id).
+
+    When `snapshots` includes the sidecar tables
+    (ADR-source-sidecar-attributes): each `source_attributes` and
+    `building_lineage` row has a unique building_id that resolves in
+    buildings with the same `source_ref`; every lineage `spec_sha256`
+    resolves in `source_specs` and every non-NULL `source_version_name` in
+    `inventory_versions` (both read at the head of main).
     """
     buildings = table_at(spark, catalog, "buildings", snapshots["buildings"], namespace)
     geometries = table_at(
@@ -982,6 +1357,43 @@ def check_inventory_invariants(
     spark.table(_fq(catalog, "sources", namespace)).createOrReplaceTempView(
         "_rqm_check_s"
     )
+    views = ["_rqm_check_b", "_rqm_check_g", "_rqm_check_s"]
+    sidecar_checks = ""
+    if all(t in snapshots for t in SIDECAR_TABLES):
+        for table, view in (
+            ("source_attributes", "_rqm_check_a"),
+            ("building_lineage", "_rqm_check_l"),
+        ):
+            table_at(
+                spark, catalog, table, snapshots[table], namespace
+            ).createOrReplaceTempView(view)
+            views.append(view)
+        for view in ("source_specs", "inventory_versions"):
+            spark.table(_fq(catalog, view, namespace)).createOrReplaceTempView(
+                f"_rqm_check_{view}"
+            )
+            views.append(f"_rqm_check_{view}")
+        for prefix, view in (("sidecar", "_rqm_check_a"), ("lineage", "_rqm_check_l")):
+            sidecar_checks += f"""
+              , (SELECT COUNT(*) - COUNT(DISTINCT building_id) FROM {view})
+                  AS {prefix}_duplicate_ids
+              , (SELECT COUNT(*) FROM {view} x LEFT ANTI JOIN _rqm_check_b b
+                   ON x.building_id = b.building_id)
+                  AS {prefix}_orphans
+              , (SELECT COUNT(*) FROM {view} x JOIN _rqm_check_b b
+                   ON x.building_id = b.building_id
+                 WHERE NOT (x.source_ref <=> b.source_ref))
+                  AS {prefix}_source_mismatch
+            """
+        sidecar_checks += """
+              , (SELECT COUNT(*) FROM _rqm_check_l l LEFT ANTI JOIN _rqm_check_source_specs p
+                   ON l.spec_sha256 = p.spec_sha256)
+                  AS lineage_unknown_spec
+              , (SELECT COUNT(*) FROM _rqm_check_l l LEFT ANTI JOIN _rqm_check_inventory_versions v
+                   ON l.source_version_name = v.version_name
+                 WHERE l.source_version_name IS NOT NULL)
+                  AS lineage_unknown_version
+        """
     hashed_id = source_building_id_sql("source_ref", "source_record_id")
     try:
         row = spark.sql(
@@ -1013,10 +1425,11 @@ def check_inventory_invariants(
               (SELECT COUNT(*) FROM _rqm_check_g g LEFT ANTI JOIN _rqm_check_b b
                  ON g.building_id = b.building_id)
                 AS orphan_geometries
+              {sidecar_checks}
             """
         ).collect()[0]
     finally:
-        for view in ("_rqm_check_b", "_rqm_check_g", "_rqm_check_s"):
+        for view in views:
             spark.catalog.dropTempView(view)
     messages = {
         "no_point": "buildings without a selected computation point (rule 1)",
@@ -1028,8 +1441,21 @@ def check_inventory_invariants(
         "null_source": "buildings without a source_ref",
         "unregistered_source": "buildings whose source_ref is not in sources",
         "orphan_geometries": "geometries whose building is missing",
+        "sidecar_duplicate_ids": "duplicate building_id values in source_attributes",
+        "sidecar_orphans": "source_attributes rows whose building is missing",
+        "sidecar_source_mismatch": "source_attributes rows whose source_ref "
+        "differs from their building's",
+        "lineage_duplicate_ids": "duplicate building_id values in building_lineage",
+        "lineage_orphans": "building_lineage rows whose building is missing",
+        "lineage_source_mismatch": "building_lineage rows whose source_ref "
+        "differs from their building's",
+        "lineage_unknown_spec": "building_lineage rows whose spec_sha256 is not "
+        "in source_specs",
+        "lineage_unknown_version": "building_lineage rows whose source_version_name "
+        "is not a registered version",
     }
-    return [f"{row[k]} {msg}" for k, msg in messages.items() if row[k]]
+    present = row.asDict()
+    return [f"{row[k]} {msg}" for k, msg in messages.items() if present.get(k)]
 
 
 def check_consistency(
@@ -1040,12 +1466,14 @@ def check_consistency(
 ) -> list[str]:
     """Problems with the version registry, tags, change log, and data.
 
-    Checks (ADR-versioning): every version is tagged on both tables at the
+    Checks (ADR-versioning): every version is tagged on every versioned table at the
     recorded snapshots; no tag lacks a registry row (failed commit);
     version names are unique; parent / merged versions resolve without
-    cycles; change-log counts match the registry; and, with
-    `check_invariants`, the ADR-nsi-minimal rules hold at every version.
-    Returns an empty list when everything is consistent.
+    cycles; change-log counts match the registry; with `check_invariants`,
+    the ADR-nsi-minimal rules and the sidecar invariants hold at every
+    version (`check_inventory_invariants`); and every `source_specs`
+    document hashes to its `spec_sha256` (`check_spec_registry`). Returns
+    an empty list when everything is consistent.
     """
     problems: list[str] = []
     registry = _registry(spark, catalog, namespace).collect()
@@ -1123,6 +1551,31 @@ def check_consistency(
                     spark, catalog, snapshots, namespace
                 )
             )
+    problems.extend(check_spec_registry(spark, catalog, namespace))
+    return problems
+
+
+def check_spec_registry(
+    spark: SparkSession, catalog: str, namespace: str = NAMESPACE
+) -> list[str]:
+    """Problems with `source_specs`: duplicate hashes, or a `spec_document`
+    whose SHA-256 is not its `spec_sha256`."""
+    row = spark.sql(
+        f"""
+        SELECT COUNT(*) - COUNT(DISTINCT spec_sha256) AS duplicates,
+               COALESCE(SUM(CASE WHEN sha2(spec_document, 256) <> spec_sha256
+                            THEN 1 ELSE 0 END), 0) AS bad_hash
+        FROM {_fq(catalog, "source_specs", namespace)}
+        """
+    ).collect()[0]
+    problems = []
+    if row["duplicates"]:
+        problems.append(f"source_specs: {row['duplicates']} duplicate spec_sha256 rows")
+    if row["bad_hash"]:
+        problems.append(
+            f"source_specs: {row['bad_hash']} rows whose spec_document does not "
+            "hash to spec_sha256"
+        )
     return problems
 
 
@@ -1208,6 +1661,8 @@ def export_version(
     *,
     where: str | None = None,
     sources: Iterable[str] | None = None,
+    include_sidecar: bool | None = None,
+    include_lineage: bool = True,
     namespace: str = NAMESPACE,
 ) -> dict:
     """Export `version` as one parquet file plus a pinning manifest.
@@ -1220,6 +1675,13 @@ def export_version(
     snapshots, so exporting the same version again later gives the same rows
     however the inventory has changed since. Returns the manifest, which
     records the source filter and the exported row count per source.
+
+    The sidecar tables of the exported buildings are written beside the data
+    (ADR-source-sidecar-attributes), `_`-prefixed so parquet readers of the
+    export directory skip them like the manifest: `_source_attributes.parquet`
+    (when `include_sidecar`; default: when an exported source declares a
+    sidecar), and with `include_lineage` `_building_lineage.parquet` plus
+    `_source_specs.json`, the specs the lineage references.
     """
     selected = None
     if sources is not None:
@@ -1240,18 +1702,72 @@ def export_version(
         r["source_ref"]: r["count"]
         for r in exported.groupBy("source_ref").count().orderBy("source_ref").collect()
     }
+    registry = {
+        r["source_ref"]: r
+        for r in spark.table(_fq(catalog, "sources", namespace)).collect()
+    }
+    sidecar_schema_by_source = {
+        ref: dict(registry[ref]["sidecar_schema"])
+        for ref in per_source
+        if ref in registry and registry[ref]["sidecar_schema"] is not None
+    }
+    if include_sidecar is None:
+        include_sidecar = bool(sidecar_schema_by_source)
+
+    extra: dict[str, object] = {
+        "row_count": sum(per_source.values()),
+        "filter": where,
+        "sources": selected,
+        "rows_by_source": per_source,
+    }
+    ids = exported.select("building_id")
+    if include_sidecar:
+        attributes = read_version(
+            spark, catalog, version, "source_attributes", namespace
+        ).join(ids, "building_id", "left_semi")
+        path = out / SIDECAR_EXPORTS["source_attributes"]
+        attributes.orderBy("building_id").coalesce(1).write.mode("overwrite").parquet(
+            str(path)
+        )
+        extra["n_source_attributes_rows"] = spark.read.parquet(str(path)).count()
+        extra["sidecar_schema_by_source"] = sidecar_schema_by_source
+    if include_lineage:
+        lineage = read_version(
+            spark, catalog, version, "building_lineage", namespace
+        ).join(ids, "building_id", "left_semi")
+        path = out / SIDECAR_EXPORTS["building_lineage"]
+        lineage.orderBy("building_id").coalesce(1).write.mode("overwrite").parquet(
+            str(path)
+        )
+        written = spark.read.parquet(str(path))
+        referenced = written.select("spec_sha256").distinct()
+        specs = (
+            spark.table(_fq(catalog, "source_specs", namespace))
+            .join(referenced, "spec_sha256", "left_semi")
+            .orderBy("spec_sha256")
+            .collect()
+        )
+        documents = [
+            {
+                "spec_sha256": s["spec_sha256"],
+                "source_ref": s["source_ref"],
+                "spec_uri": s["spec_uri"],
+                "registered_at": s["registered_at"].isoformat(),
+                "spec": json.loads(s["spec_document"]),
+                "spec_document": s["spec_document"],
+            }
+            for s in specs
+        ]
+        (out / SIDECAR_EXPORTS["source_specs"]).write_text(
+            json.dumps(documents, indent=2) + "\n"
+        )
+        extra["n_lineage_rows"] = written.count()
+        extra["n_specs"] = len(documents)
+        extra["specs_by_sha256"] = {
+            d["spec_sha256"]: d["source_ref"] for d in documents
+        }
     return write_export_manifest(
-        spark,
-        catalog,
-        version,
-        out,
-        extra={
-            "row_count": sum(per_source.values()),
-            "filter": where,
-            "sources": selected,
-            "rows_by_source": per_source,
-        },
-        namespace=namespace,
+        spark, catalog, version, out, extra=extra, namespace=namespace
     )
 
 

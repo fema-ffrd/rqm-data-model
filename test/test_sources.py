@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import copy
+import hashlib
+import json
 from pathlib import Path
 
 import pytest
@@ -206,6 +208,95 @@ def test_load_spec_reports_yaml_errors(tmp_path: Path) -> None:
     path.write_text("source_ref: [unclosed\n")
     with pytest.raises(SpecError, match="not valid YAML"):
         load_spec(path)
+
+
+def test_spec_hash_ignores_yaml_cosmetics(tmp_path: Path) -> None:
+    compact = tmp_path / "compact.yaml"
+    compact.write_text(yaml.safe_dump(VALID, sort_keys=True))
+    reordered = dict(reversed(list(VALID.items())))
+    reordered["fields"] = dict(reversed(list(VALID["fields"].items())))
+    pretty = tmp_path / "pretty.yaml"
+    pretty.write_text(
+        "# a comment\n"
+        + yaml.safe_dump(reordered, sort_keys=False, indent=4, width=40)
+        + "\n\n"
+    )
+    a, b = load_spec(compact), load_spec(pretty)
+    assert a.sha256 == b.sha256 == parse_spec(VALID).sha256
+    assert a.document == b.document
+    assert hashlib.sha256(a.document.encode()).hexdigest() == a.sha256
+    assert json.loads(a.document) == json.loads(json.dumps(VALID))
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"fields__num_story": "FLOORS"},
+        {"fields__found_ht": {"expr": "FFE_IN / 12"}},
+        {"fields__occtype": {"from": "LANDUSE", "map": {"A1": "RES2"}}},
+        {"description": "now documented"},
+        {"sidecar": {"fields": {"zoning": "ZONING"}}},
+    ],
+)
+def test_spec_hash_changes_with_semantics(changes: dict) -> None:
+    assert parse_spec(spec_with(**changes)).sha256 != parse_spec(VALID).sha256
+
+
+def test_sidecar_rule_shapes() -> None:
+    spec = parse_spec(
+        spec_with(
+            sidecar={
+                "fields": {
+                    "policy_term": {"from": "POLICY_TERM"},
+                    "premium_usd": {"from": "PREMIUM", "type": "double"},
+                    "deductible_pct": "DEDUCTIBLE_PCT",
+                    # The raw code behind a crosswalk can be kept too.
+                    "landuse_code": "LANDUSE",
+                }
+            }
+        )
+    )
+    assert [(r.key, r.source, r.type) for r in spec.sidecar] == [
+        ("policy_term", "POLICY_TERM", "string"),
+        ("premium_usd", "PREMIUM", "double"),
+        ("deductible_pct", "DEDUCTIBLE_PCT", "string"),
+        ("landuse_code", "LANDUSE", "string"),
+    ]
+    assert spec.sidecar_schema == {
+        "policy_term": "string",
+        "premium_usd": "double",
+        "deductible_pct": "string",
+        "landuse_code": "string",
+    }
+    assert {"POLICY_TERM", "PREMIUM", "DEDUCTIBLE_PCT"} <= spec.input_columns
+    assert parse_spec(VALID).sidecar == () and parse_spec(VALID).sidecar_schema is None
+
+
+@pytest.mark.parametrize(
+    ("sidecar", "expected"),
+    [
+        ({"fields": {"num_story": "FLOORS"}}, "already mapped in fields"),
+        ({"fields": {"val_cont": "CONTENTS"}}, "is a buildings column"),
+        ({"fields": {"VAL_CONT": "CONTENTS"}}, "is a buildings column"),
+        ({"fields": {"building_id": "PARCEL_ID"}}, "is a buildings column"),
+        ({"fields": {"source_ref": "SRC"}}, "is a buildings column"),
+        ({"fields": {"source_record_id": "PARCEL_ID"}}, "is a buildings column"),
+        ({"fields": {"ingested_at": "TS"}}, "is a buildings column"),
+        ({"fields": {"premium": {"from": "P", "type": "money"}}}, "type 'money'"),
+        ({"fields": {"premium": {"from": "P", "expr": "P * 2"}}}, "unknown key 'expr'"),
+        ({"fields": {"premium": {"from": "P", "map": {"a": 1}}}}, "unknown key 'map'"),
+        ({"fields": {"premium": {"from": "P", "default": 0}}}, "unknown key 'default'"),
+        ({"fields": {"premium": {"type": "double"}}}, "'from' (the input column)"),
+        ({"fields": {"bad key": "P"}}, "key must match"),
+        ({"fields": {"premium": 3}}, "expected a column name"),
+        ({"fields": {}}, "sidecar.fields: required"),
+        ({"columns": {"premium": "P"}}, "unknown key 'columns'"),
+        (["premium"], "sidecar: must be a mapping"),
+    ],
+)
+def test_sidecar_validation_rules(sidecar, expected: str) -> None:
+    found = problems(spec_with(sidecar=sidecar))
+    assert any(expected in p for p in found), found
 
 
 @pytest.mark.parametrize("network", [False, True])

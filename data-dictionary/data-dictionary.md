@@ -1,15 +1,18 @@
 # Risk Quantification Methodology (RQM) Data Model — NSI Minimal — Data Dictionary
 
-**Version:** 0.4.0 &nbsp;|&nbsp; **Companion:** `fema-ffrd/inland-consequences` &nbsp;|&nbsp; **Query engine:** Apache Sedona (Spark 4.1)
+**Version:** 0.5.0 &nbsp;|&nbsp; **Companion:** `fema-ffrd/inland-consequences` &nbsp;|&nbsp; **Query engine:** Apache Sedona (Spark 4.1)
 
-NSI-minimal edition: a focused, loadable schema for a single National Structure Inventory parquet ingest, with first-class multiple-geometry support (ADR-geometry) preserved so additional footprint sources can be attached beside each NSI point without a schema break. Component decomposition, attribute uncertainty, hazard links, DDFs, loss realizations, export contracts, provenance registry, and valid-time (bitemporal) history are deferred; re-entry points are documented in ADR-nsi-minimal. Inventory versions, branches, and the per-building change log follow ADR-versioning. Other building inventories load side by side with NSI, scoped by `source_ref` and registered in `sources`, per ADR-multi-source. The previous full-coverage dictionary is preserved at `data-dictionary-full.yaml`.
+NSI-minimal edition: a focused, loadable schema for a single National Structure Inventory parquet ingest, with first-class multiple-geometry support (ADR-geometry) preserved so additional footprint sources can be attached beside each NSI point without a schema break. Component decomposition, attribute uncertainty, hazard links, DDFs, loss realizations, export contracts, provenance registry, and valid-time (bitemporal) history are deferred; re-entry points are documented in ADR-nsi-minimal. Inventory versions, branches, and the per-building change log follow ADR-versioning. Other building inventories load side by side with NSI, scoped by `source_ref` and registered in `sources`, per ADR-multi-source. Source fields with no `buildings` column, and the load and spec behind each building, live in `source_attributes`, `building_lineage`, and `source_specs` per ADR-source-sidecar-attributes. The previous full-coverage dictionary is preserved at `data-dictionary-full.yaml`.
 
 ## Contents
 
 - **Domain A — Inventory (multi-source structures + first-class geometry)**
   - [`buildings`](#buildings)
   - [`geometries`](#geometries)
+  - [`source_attributes`](#source_attributes)
+  - [`building_lineage`](#building_lineage)
   - [`sources`](#sources)
+  - [`source_specs`](#source_specs)
   - [`inventory_versions`](#inventory_versions)
   - [`inventory_changes`](#inventory_changes)
 
@@ -101,6 +104,33 @@ First-class geometry registry (ADR-geometry preserved). Each row holds one geome
 | `geom` | geometry |  | NOT NULL | Native Iceberg v3 GEOMETRY(EPSG:3857); Point for role='point', Polygon/MultiPolygon for role='footprint'. Sedona reads it via ST_GeomFromWKB(spark_st_asbinary(geom)). |
 | `ingested_at` | timestamp |  | NOT NULL | When this row was last written (insert, or a load that changed its point or CRS). |
 
+### `source_attributes`
+**Storage:** Iceberg (via Apache Sedona) &nbsp;|&nbsp; **Grain:** At most one row per building (buildings with at least one sidecar value).
+
+Source-native fields that have no buildings column (e.g. a portfolio's policy term, agent, premium, construction class), carried through verbatim from the spec's `sidecar:` block (ADR-source-sidecar-attributes). Keyed by buildings.building_id and written by the same scoped load as buildings: a reload upserts the source's rows and deletes rows of its buildings that are gone or have no sidecar value left; other sources are never touched. A spec without a sidecar block writes no rows. Versioned and branched with buildings (same tag per version); a commit deletes rows whose building an edit removed. Physical layout: partitioned by source_ref, sorted by building_id; merge-on-read writes.
+
+| Column | Type | Key | Null | Description |
+|---|---|---|---|---|
+| `building_id` | bigint | PK | NOT NULL | The building (1:1). |
+| `source_ref` | varchar(64) | FK → `sources.source_ref` | NOT NULL | Equals buildings.source_ref of the same building. |
+| `source_record_id` | text |  |  | Native id of the structure in its source |
+| `attributes` | map<varchar, varchar> |  | NOT NULL | Sidecar output key -> CAST(source value AS STRING). A NULL source value leaves the key out (present means the source had a value). Read typed with the declared type in sources.sidecar_schema, e.g. CAST(attributes['premium_usd'] AS DOUBLE). |
+| `ingested_at` | timestamp |  | NOT NULL | When the row was last written (insert |
+
+### `building_lineage`
+**Storage:** Iceberg (via Apache Sedona) &nbsp;|&nbsp; **Grain:** One row per building.
+
+Canonical-field lineage (ADR-source-sidecar-attributes): which load (version) and which exact mapping spec produced each building's buildings columns. Follow spec_sha256 to source_specs and read the spec's `fields` rule for a column (from / expr / map / default) to learn which source column populated it (tools/sidecar.py source_of). Points at the last load that added or changed the building: a reload rewrites only the rows of buildings whose buildings columns it changed (compared against the pre-load snapshot), so a new spec reaches only the buildings whose values it changes; edits do not rewrite it. Versioned and branched with buildings; a commit deletes rows whose building an edit removed. Physical layout: partitioned by source_ref, sorted by building_id; merge-on-read writes.
+
+| Column | Type | Key | Null | Description |
+|---|---|---|---|---|
+| `building_id` | bigint | PK | NOT NULL | The building (1:1). |
+| `source_ref` | varchar(64) | FK → `sources.source_ref` | NOT NULL | Equals buildings.source_ref of the same building. |
+| `source_record_id` | text |  |  | Native id of the structure in its source |
+| `source_version_name` | varchar(100) | FK → `inventory_versions.version_name` |  | Version of the last load that added or changed the building. A load given its version records it directly; otherwise the next commit on the branch fills it in. Migration backfill: the last NSI release in the branch history that added or modified the building (inventory_changes), else the root NSI release. |
+| `spec_sha256` | varchar(64) | FK → `source_specs.spec_sha256` | NOT NULL | The spec of the last load that added or changed the building; its fields block produced the buildings columns. |
+| `ingested_at` | timestamp |  | NOT NULL | When the row was last written. |
+
 ### `sources`
 **Storage:** Iceberg (via Apache Sedona) &nbsp;|&nbsp; **Grain:** One row per source inventory (dataset lineage).
 
@@ -112,13 +142,27 @@ Registry of the inventories loaded into buildings (ADR-multi-source). A source_r
 | `source_name` | varchar(200) |  | NOT NULL | Human-readable name. |
 | `source_kind` | varchar(32) |  | NOT NULL | Enum source_kind: national_inventory, local_inventory, commercial_inventory, project_inventory, field_survey, remote_sensing, or other. |
 | `description` | text |  |  | Free text. |
-| `spec_sha256` | varchar(64) |  |  | SHA-256 of the YAML mapping spec last used to load the source. |
+| `spec_sha256` | varchar(64) | FK → `source_specs.spec_sha256` |  | Canonical SHA-256 of the mapping spec last used to load the source (ADR-source-sidecar-attributes). Rows written before that migration hold the spec file's hash until the source is reloaded. |
 | `updated_at` | timestamp |  | NOT NULL | When the row was last written. |
+| `sidecar_schema` | map<varchar, varchar> |  |  | Sidecar output key -> declared type (string, double, bigint, boolean, timestamp, date) from the spec's sidecar block; NULL if the source carries no sidecar fields. |
+
+### `source_specs`
+**Storage:** Iceberg (via Apache Sedona) &nbsp;|&nbsp; **Grain:** One row per distinct mapping spec (by canonical hash).
+
+Immutable registry of every YAML mapping spec a load has used (ADR-source-sidecar-attributes). A spec is identified by spec_sha256, the SHA-256 of its canonical JSON (keys sorted recursively, compact separators), so reformatting the YAML keeps the hash and any semantic change gives a new row. The canonical document itself is stored, so "which source column produced buildings.val_struct for this building?" is answerable from the warehouse alone (building_lineage -> source_specs). Append-only, on main only (not versioned or branched), never deleted. sha2(spec_document, 256) = spec_sha256 is checked by versioning.check_consistency.
+
+| Column | Type | Key | Null | Description |
+|---|---|---|---|---|
+| `spec_sha256` | varchar(64) | PK | NOT NULL | SHA-256 of spec_document. |
+| `source_ref` | varchar(64) | FK → `sources.source_ref` | NOT NULL | Source the spec was authored for. |
+| `spec_uri` | text |  |  | Where the authored YAML lived when first registered (repo-relative or absolute path). Informational; spec_document is authoritative. |
+| `spec_document` | text |  | NOT NULL | Canonical JSON of the spec (tools/sources.py canonical_document). |
+| `registered_at` | timestamp |  | NOT NULL | First time the spec was seen. |
 
 ### `inventory_versions`
 **Storage:** Iceberg (via Apache Sedona) &nbsp;|&nbsp; **Grain:** One row per named inventory version.
 
-Version registry (ADR-versioning). Each row names an immutable state of the inventory: `version_name` is also an Iceberg tag on `buildings` and `geometries` pointing at the recorded snapshots, so the version reads as `SELECT … FROM rqm.inventory.buildings VERSION AS OF '<version_name>'`. Records who committed it, why, from which input, on which branch, its lineage (parent and merged versions), and change counts relative to the parent. Written last when a version is committed, so a version exists only once registered; a tag without a row is an incomplete commit.
+Version registry (ADR-versioning). Each row names an immutable state of the inventory: `version_name` is also an Iceberg tag on `buildings`, `geometries`, `source_attributes`, and `building_lineage` pointing at the recorded snapshots, so the version reads as `SELECT … FROM rqm.inventory.buildings VERSION AS OF '<version_name>'`. Records who committed it, why, from which input, on which branch, its lineage (parent and merged versions), and change counts relative to the parent. Written last when a version is committed, so a version exists only once registered; a tag without a row is an incomplete commit.
 
 | Column | Type | Key | Null | Description |
 |---|---|---|---|---|
@@ -134,6 +178,8 @@ Version registry (ADR-versioning). Each row names an immutable state of the inve
 | `reason` | text |  |  | Why the version was committed (RQM-16). |
 | `buildings_snapshot_id` | bigint |  | NOT NULL | Iceberg snapshot of buildings tagged with version_name. |
 | `geometries_snapshot_id` | bigint |  | NOT NULL | Iceberg snapshot of geometries tagged with version_name. |
+| `source_attributes_snapshot_id` | bigint |  |  | Iceberg snapshot of source_attributes tagged with version_name. Versions committed before the table existed point at its empty root snapshot (filled in by the schema migration). |
+| `building_lineage_snapshot_id` | bigint |  |  | Iceberg snapshot of building_lineage tagged with version_name (versions older than the table: its empty root snapshot). |
 | `n_buildings` | bigint |  | NOT NULL | Buildings in the version. |
 | `n_added` | bigint |  | NOT NULL | Buildings added relative to parent_version (all of them for a root version). |
 | `n_removed` | bigint |  | NOT NULL | Buildings removed relative to parent_version. |

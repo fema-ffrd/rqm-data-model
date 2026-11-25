@@ -23,10 +23,15 @@ by side with every other source (no cross-source matching). A load:
    crosswalks, defaults), casts to the `buildings` types, transforms the
    geometry to EPSG:3857, derives a computation point (`ST_PointOnSurface`
    for polygons) and, unless mapped, `x` / `y` as WGS84 lon / lat;
-4. upserts the `sources` registry row (main, never branched);
+4. registers the spec in `source_specs` (by its canonical hash) and upserts
+   the `sources` registry row (both on main, never branched);
 5. MERGEs the source's buildings as a full replacement *of that source*:
    rows of other sources are never touched;
-6. MERGEs the source's geometries (a computation point per building, plus
+6. MERGEs the source's `source_attributes` (the spec's `sidecar:` fields),
+   scoped the same way, and `building_lineage` (spec hash and version of
+   the last load that changed each building: only the buildings this load
+   added or changed are rewritten; ADR-source-sidecar-attributes);
+7. MERGEs the source's geometries (a computation point per building, plus
    a display footprint for polygon sources), deletes the source's stale
    geometries and any geometry whose building is gone.
 
@@ -39,6 +44,7 @@ from __future__ import annotations
 
 import argparse
 import atexit
+import json
 import shutil
 import sys
 import tempfile
@@ -60,12 +66,15 @@ from ingest_nsi import (
     default_editor,
     geometry_id_expr,
     native_geom_sql,
+    ref_snapshot_id,
     require_branch,
     settings_from_args,
     source_building_id_expr,
     table_name,
     validate_ref_name,
 )
+from py4j.protocol import Py4JError
+from pyspark.errors import PySparkException
 from pyspark.sql import Column, DataFrame, Row, SparkSession
 from pyspark.sql import functions as F
 from sources import SourceSpec, SpecError, load_spec
@@ -153,7 +162,8 @@ def read_input(
             )
             if spec.input.geometry.column in df.columns:
                 return df, "geometry"
-        except Exception as err:  # Sedona reader unavailable or layer unsupported
+        # Sedona reader unavailable or layer unsupported.
+        except (PySparkException, Py4JError) as err:
             print(
                 f"note: Sedona GeoPackage reader failed ({type(err).__name__}); "
                 "staging the layer through pyogrio",
@@ -227,6 +237,16 @@ def _with_geometry(df: DataFrame, spec: SourceSpec, encoding: str) -> DataFrame:
 _INTEGRAL_TYPES = {"smallint", "int", "bigint"}
 
 
+def identity_columns(spec: SourceSpec) -> tuple[Column, Column | None]:
+    """(source_record_id, building_id) of an input row; building_id is None
+    for hashed ids, which `source_building_id_expr` computes from the
+    record id once `source_ref` is a column."""
+    id_col = F.col(quote_ident(spec.id.column))
+    if spec.id.scheme == "native":
+        return id_col.cast("bigint").cast("string"), id_col.cast("bigint")
+    return id_col.cast("string"), None
+
+
 def rule_column(
     spec: SourceSpec, target: str, text_columns: frozenset[str] = frozenset()
 ) -> Column:
@@ -280,13 +300,7 @@ def prepare_input(
         f.name for f in raw.schema.fields if f.dataType.typeName() == "string"
     )
 
-    id_col = F.col(quote_ident(spec.id.column))
-    if spec.id.scheme == "native":
-        record_id = id_col.cast("bigint").cast("string")
-        building_id = id_col.cast("bigint")
-    else:
-        record_id = id_col.cast("string")
-        building_id = None
+    record_id, building_id = identity_columns(spec)
     subcode = spec.input.geometry.subcode
     geom_ref = (
         F.concat(
@@ -429,18 +443,24 @@ def crosswalk_gaps(
 def register_source(
     spark: SparkSession, spec: SourceSpec, catalog: str, namespace: str = NAMESPACE
 ) -> None:
-    """Upsert the `sources` row of `spec` (always on main; never deleted)."""
+    """Upsert the `sources` row of `spec` (always on main; never deleted),
+    including its `spec_sha256` and `sidecar_schema`."""
     target = table_name(catalog, "sources", namespace)
+    schema = spec.sidecar_schema
     row = spark.sql(
         "SELECT :source_ref AS source_ref, :source_name AS source_name, "
         ":source_kind AS source_kind, CAST(:description AS STRING) AS description, "
-        "CAST(:spec_sha256 AS STRING) AS spec_sha256, current_timestamp() AS updated_at",
+        "CAST(:spec_sha256 AS STRING) AS spec_sha256, current_timestamp() AS updated_at, "
+        "CAST(IF(:has_sidecar, from_json(:sidecar_schema, 'map<string,string>'), NULL) "
+        "AS MAP<STRING, STRING>) AS sidecar_schema",
         args={
             "source_ref": spec.source_ref,
             "source_name": spec.source_name,
             "source_kind": spec.source_kind,
             "description": spec.description,
             "spec_sha256": spec.sha256,
+            "has_sidecar": schema is not None,
+            "sidecar_schema": json.dumps(schema or {}),
         },
     )
     row.createOrReplaceTempView("_rqm_source_row")
@@ -455,6 +475,59 @@ def register_source(
         )
     finally:
         spark.catalog.dropTempView("_rqm_source_row")
+
+
+def register_spec(
+    spark: SparkSession, spec: SourceSpec, catalog: str, namespace: str = NAMESPACE
+) -> bool:
+    """Add `spec` to the `source_specs` registry unless its hash is there.
+
+    Append-only and on main only: a registered `spec_sha256` is never
+    updated, so the first `spec_uri` sticks. Returns True if a row was added.
+    """
+    target = table_name(catalog, "source_specs", namespace)
+    exists = (
+        spark.table(target).where(F.col("spec_sha256") == spec.sha256).limit(1).count()
+    )
+    if exists:
+        return False
+    row = spark.sql(
+        "SELECT :spec_sha256 AS spec_sha256, :source_ref AS source_ref, "
+        "CAST(:spec_uri AS STRING) AS spec_uri, :spec_document AS spec_document, "
+        "current_timestamp() AS registered_at",
+        args={
+            "spec_sha256": spec.sha256,
+            "source_ref": spec.source_ref,
+            "spec_uri": spec.spec_uri,
+            "spec_document": spec.document,
+        },
+    )
+    row.createOrReplaceTempView("_rqm_spec_row")
+    try:
+        spark.sql(
+            f"""
+            MERGE INTO {target} t USING _rqm_spec_row s
+            ON t.spec_sha256 = s.spec_sha256
+            WHEN NOT MATCHED THEN INSERT *
+            """
+        )
+    finally:
+        spark.catalog.dropTempView("_rqm_spec_row")
+    return True
+
+
+def get_spec(
+    spark: SparkSession, catalog: str, sha256: str, namespace: str = NAMESPACE
+) -> Row:
+    """The `source_specs` row of `sha256`; raises KeyError if unregistered."""
+    rows = (
+        spark.table(table_name(catalog, "source_specs", namespace))
+        .where(F.col("spec_sha256") == sha256)
+        .collect()
+    )
+    if not rows:
+        raise KeyError(f"unknown spec {sha256!r}")
+    return rows[0]
 
 
 def list_sources(
@@ -641,6 +714,264 @@ def merge_geometries(
     ).collect()[0]["n"]
 
 
+def build_sidecar_df(
+    spark: SparkSession, spec: SourceSpec, input_path: str | Path
+) -> DataFrame:
+    """The staged `source_attributes` rows of a load: one per input row with
+    at least one non-NULL sidecar value (empty without a `sidecar:` block).
+
+    `attributes` maps each sidecar key to `CAST(value AS STRING)`; keys whose
+    value is NULL are left out.
+    """
+    raw, _ = read_input(spark, spec, input_path)
+    if not spec.sidecar:
+        return spark.sql(
+            "SELECT CAST(NULL AS BIGINT) AS building_id, CAST(NULL AS STRING) AS source_ref, "
+            "CAST(NULL AS STRING) AS source_record_id, "
+            "CAST(NULL AS MAP<STRING, STRING>) AS attributes, "
+            "CAST(NULL AS TIMESTAMP) AS ingested_at"
+        ).limit(0)
+    record_id, building_id = identity_columns(spec)
+    entries = F.array(
+        *[
+            F.struct(
+                F.lit(rule.key).alias("key"),
+                F.col(quote_ident(rule.source)).cast("string").alias("value"),
+            )
+            for rule in sorted(spec.sidecar, key=lambda r: r.key)
+        ]
+    )
+    attributes = F.map_from_entries(F.filter(entries, lambda e: e["value"].isNotNull()))
+    rows = raw.select(
+        F.lit(spec.source_ref).alias("source_ref"),
+        record_id.alias("source_record_id"),
+        *([building_id.alias("building_id")] if building_id is not None else []),
+        attributes.alias("attributes"),
+    )
+    if building_id is None:
+        rows = rows.withColumn(
+            "building_id",
+            source_building_id_expr(F.col("source_ref"), F.col("source_record_id")),
+        )
+    return rows.where(F.size("attributes") > 0).select(
+        "building_id",
+        "source_ref",
+        "source_record_id",
+        "attributes",
+        F.current_timestamp().alias("ingested_at"),
+    )
+
+
+def _scope_has_rows(spark: SparkSession, table: str, source_ref: str) -> bool:
+    return bool(
+        spark.table(table).where(F.col("source_ref") == source_ref).limit(1).count()
+    )
+
+
+# Map columns are not comparable in Spark SQL; compare their sorted entries.
+_MAP_JSON = "to_json(array_sort(map_entries({})))"
+
+
+def merge_source_attributes(
+    spark: SparkSession,
+    spec: SourceSpec,
+    input_path: str | Path,
+    catalog: str,
+    namespace: str = NAMESPACE,
+    branch: str | None = None,
+) -> int:
+    """MERGE the source's sidecar rows into `source_attributes` on `branch`;
+    run after `merge_buildings`.
+
+    Scoped like buildings: rows of this source are inserted, updated when
+    their attributes or record id changed, and deleted when the building is
+    gone or has no sidecar value left; other sources are never touched. A
+    spec without a `sidecar:` block only deletes the source's rows. Returns
+    the source's row count at the branch head.
+    """
+    target = table_name(catalog, "source_attributes", namespace, branch)
+    ref = spec.source_ref
+    if not spec.sidecar:
+        if _scope_has_rows(spark, target, ref):
+            spark.sql(f"DELETE FROM {target} WHERE source_ref = {sql_str(ref)}")
+        return 0
+    present = spark.table(table_name(catalog, "buildings", namespace, branch)).select(
+        "building_id"
+    )
+    rows = build_sidecar_df(spark, spec, input_path).join(
+        present, "building_id", "left_semi"
+    )
+    rows.createOrReplaceTempView("_rqm_load_sidecar")
+    changed = (
+        f"NOT ({_MAP_JSON.format('t.attributes')} <=> "
+        f"{_MAP_JSON.format('s.attributes')}) "
+        "OR NOT (t.source_record_id <=> s.source_record_id) "
+        "OR NOT (t.source_ref <=> s.source_ref)"
+    )
+    try:
+        spark.sql(
+            f"""
+            MERGE INTO {target} t
+            USING _rqm_load_sidecar s
+            ON t.building_id = s.building_id
+            WHEN MATCHED AND ({changed}) THEN UPDATE SET *
+            WHEN NOT MATCHED THEN INSERT *
+            WHEN NOT MATCHED BY SOURCE AND t.source_ref = {sql_str(ref)} THEN DELETE
+            """
+        )
+    finally:
+        spark.catalog.dropTempView("_rqm_load_sidecar")
+    return spark.table(target).where(F.col("source_ref") == ref).count()
+
+
+def buildings_snapshot(
+    spark: SparkSession,
+    catalog: str,
+    namespace: str = NAMESPACE,
+    branch: str | None = None,
+) -> int | None:
+    """Snapshot id at the head of `branch` of `buildings` (None if it has none).
+
+    Taken before `merge_buildings`, it tells `merge_building_lineage` which
+    buildings the load changed.
+    """
+    return ref_snapshot_id(
+        spark, table_name(catalog, "buildings", namespace), branch or "main"
+    )
+
+
+def changed_buildings(
+    spark: SparkSession,
+    spec: SourceSpec,
+    catalog: str,
+    namespace: str = NAMESPACE,
+    branch: str | None = None,
+    *,
+    since: int | None,
+) -> DataFrame:
+    """The source's buildings at the head of `branch` that were added, or
+    whose compared columns (`BUILDING_COMPARE_COLUMNS`) differ, relative to
+    buildings snapshot `since` (None: the table was empty, so all of them).
+    """
+    head = conform_buildings(
+        spark.table(table_name(catalog, "buildings", namespace, branch))
+    ).where(source_scope_sql(spec))
+    if since is None:
+        return head
+    before = conform_buildings(
+        spark.sql(
+            f"SELECT * FROM {table_name(catalog, 'buildings', namespace)} "
+            f"VERSION AS OF {int(since)}"
+        )
+    ).where(source_scope_sql(spec))
+    same = F.col("h.building_id") == F.col("b.building_id")
+    for column in BUILDING_COMPARE_COLUMNS:
+        same &= F.col(f"h.{column}").eqNullSafe(F.col(f"b.{column}"))
+    return head.alias("h").join(before.alias("b"), same, "left_anti")
+
+
+def build_lineage_df(
+    spark: SparkSession,
+    spec: SourceSpec,
+    catalog: str,
+    namespace: str = NAMESPACE,
+    branch: str | None = None,
+    version: str | None = None,
+    *,
+    since: int | None,
+) -> DataFrame:
+    """The staged `building_lineage` rows of a load (run after
+    `merge_buildings`): one per building of the source that the load changed
+    (`changed_buildings` relative to snapshot `since`) or that has no lineage
+    row yet, naming `spec` and the version the load will be committed as
+    (NULL if unknown).
+    """
+    lineage = spark.table(
+        table_name(catalog, "building_lineage", namespace, branch)
+    ).select("building_id")
+    head = conform_buildings(
+        spark.table(table_name(catalog, "buildings", namespace, branch))
+    ).where(source_scope_sql(spec))
+    changed = changed_buildings(
+        spark, spec, catalog, namespace, branch, since=since
+    ).select("building_id")
+    unrecorded = head.join(lineage, "building_id", "left_anti").select("building_id")
+    staged = head.join(changed.union(unrecorded).distinct(), "building_id")
+    return staged.select(
+        "building_id",
+        "source_ref",
+        "source_record_id",
+        F.lit(version).cast("string").alias("source_version_name"),
+        F.lit(spec.sha256).alias("spec_sha256"),
+        F.current_timestamp().alias("ingested_at"),
+    )
+
+
+def merge_building_lineage(
+    spark: SparkSession,
+    spec: SourceSpec,
+    catalog: str,
+    namespace: str = NAMESPACE,
+    branch: str | None = None,
+    version: str | None = None,
+    *,
+    since: int | None,
+) -> int:
+    """MERGE the source's lineage rows into `building_lineage` on `branch`.
+
+    Lineage points at the last load that changed a building: only buildings
+    this load added or changed (relative to buildings snapshot `since`,
+    taken with `buildings_snapshot` before `merge_buildings`), and buildings
+    without a lineage row, get a row naming `spec` and `version`. Unchanged
+    buildings keep their row, so a reload rewrites only what it changed, and
+    a new spec reaches only the buildings whose values it changed. Rows of
+    the source's buildings that are gone are deleted; other sources are
+    never touched. Without a `version`, the rows are stamped by the next
+    `commit_version` on the branch. Returns the source's row count at the
+    branch head.
+    """
+    if version is not None:
+        validate_ref_name(version, "version")
+    target = table_name(catalog, "building_lineage", namespace, branch)
+    buildings = table_name(catalog, "buildings", namespace, branch)
+    ref = spec.source_ref
+    build_lineage_df(
+        spark, spec, catalog, namespace, branch, version, since=since
+    ).createOrReplaceTempView("_rqm_load_lineage")
+    changed = " OR ".join(
+        f"NOT (t.{c} <=> s.{c})"
+        for c in (
+            "source_ref",
+            "source_record_id",
+            "source_version_name",
+            "spec_sha256",
+        )
+    )
+    gone = (
+        f"SELECT l.building_id FROM {target} l "
+        f"LEFT ANTI JOIN {buildings} b ON l.building_id = b.building_id "
+        f"WHERE l.source_ref = {sql_str(ref)}"
+    )
+    try:
+        spark.sql(
+            f"""
+            MERGE INTO {target} t
+            USING _rqm_load_lineage s
+            ON t.building_id = s.building_id
+            WHEN MATCHED AND ({changed}) THEN UPDATE SET *
+            WHEN NOT MATCHED THEN INSERT *
+            """
+        )
+        if spark.sql(gone).limit(1).count():
+            spark.sql(
+                f"MERGE INTO {target} t USING ({gone}) g "
+                "ON t.building_id = g.building_id WHEN MATCHED THEN DELETE"
+            )
+    finally:
+        spark.catalog.dropTempView("_rqm_load_lineage")
+    return spark.table(target).where(F.col("source_ref") == ref).count()
+
+
 def load_source(
     spark: SparkSession,
     spec: SourceSpec,
@@ -648,26 +979,41 @@ def load_source(
     catalog: str,
     namespace: str = NAMESPACE,
     branch: str | None = None,
+    version: str | None = None,
 ) -> dict:
     """Load one release of a source into `branch` (default main).
 
-    Validates the input, registers the source, then MERGEs its buildings and
-    geometries as a full replacement of that source only. Returns
-    `source_ref`, `n_input`, `n_buildings` and `n_geometries` (the source's
-    rows at the branch head), `n_null_cbfips`, and `unmapped_codes`
-    (`crosswalk_gaps`).
+    Validates the input, registers the spec (`source_specs`) and the source
+    (`sources`), then MERGEs its buildings, sidecar attributes, lineage, and
+    geometries as a full replacement of that source only. `version` is the
+    version the load will be committed as, recorded in `building_lineage`
+    for the buildings the load changed (else the next `commit_version` fills
+    it in). Returns `source_ref`,
+    `n_input`, `n_buildings`, `n_source_attributes`, `n_lineage`, and
+    `n_geometries` (the source's rows at the branch head), `n_null_cbfips`,
+    and `unmapped_codes` (`crosswalk_gaps`).
     """
     require_branch(spark, catalog, branch, namespace)
     stats = validate_input(spark, spec, input_path)
+    register_spec(spark, spec, catalog, namespace)
     register_source(spark, spec, catalog, namespace)
+    before = buildings_snapshot(spark, catalog, namespace, branch)
     n_buildings = merge_buildings(
         spark, spec, input_path, catalog, namespace, branch, validate=False
+    )
+    n_sidecar = merge_source_attributes(
+        spark, spec, input_path, catalog, namespace, branch
+    )
+    n_lineage = merge_building_lineage(
+        spark, spec, catalog, namespace, branch, version, since=before
     )
     n_geometries = merge_geometries(spark, spec, input_path, catalog, namespace, branch)
     return {
         "source_ref": spec.source_ref,
         **stats,
         "n_buildings": n_buildings,
+        "n_source_attributes": n_sidecar,
+        "n_lineage": n_lineage,
         "n_geometries": n_geometries,
         "unmapped_codes": crosswalk_gaps(spark, spec, input_path),
     }
@@ -730,11 +1076,12 @@ def main(argv: list[str] | None = None) -> int:
             from versioning import ensure_version_available
 
             ensure_version_available(spark, cat, args.version, ns)
-        result = load_source(spark, spec, args.input, cat, ns, branch)
+        result = load_source(spark, spec, args.input, cat, ns, branch, args.version)
         print(
-            f"OK: loaded {result['n_buildings']} {spec.source_ref} buildings and "
-            f"{result['n_geometries']} geometries from {result['n_input']} input rows "
-            f"into branch {branch!r}."
+            f"OK: loaded {result['n_buildings']} {spec.source_ref} buildings, "
+            f"{result['n_geometries']} geometries, and "
+            f"{result['n_source_attributes']} sidecar rows from {result['n_input']} "
+            f"input rows into branch {branch!r} (spec {spec.sha256[:12]})."
         )
         if result["n_null_cbfips"]:
             print(

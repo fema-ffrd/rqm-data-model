@@ -13,6 +13,9 @@ native ids.
 |                    |                              | footprints + point-on-surface; release 2 |
 | FIELD-SURVEY-2025  | CSV lon / lat (EPSG:4326)    | sparse mapping (most fields NULL)       |
 | PROJECT-RIVERBEND  | parquet, WKB points (EPSG:3857) | planned structures for a project branch |
+| MILLIMAN-2026Q1    | parquet lon / lat (EPSG:4326) | commercial portfolio: underwriting      |
+|                    |                              | fields kept as sidecar attributes       |
+|                    |                              | (ADR-source-sidecar-attributes); release 2 |
 
 The matching specs live in `test/data/sources/*.yaml`.
 
@@ -83,6 +86,19 @@ class AssessorTruth:
 
 
 @dataclass(frozen=True)
+class MillimanTruth:
+    """What the Milliman portfolio releases contain, keyed by LOC_ID."""
+
+    release1: str
+    release2: str
+    nsi_fd_id: dict[str, int]  # location -> the NSI structure it was derived from
+    removed: tuple[str, ...]  # policies lapsed in release 2
+    renewed: tuple[str, ...]  # PREMIUM +5 % in release 2
+    deductible_dropped: tuple[str, ...]  # DEDUCTIBLE_PCT NULL in release 2
+    added: tuple[str, ...]
+
+
+@dataclass(frozen=True)
 class SyntheticSources:
     """Paths of the generated inputs plus ground truth for checks."""
 
@@ -93,6 +109,7 @@ class SyntheticSources:
     riverbend: str
     riverbend_lots: tuple[str, ...]
     seed: int
+    milliman: MillimanTruth | None = None
     extra: dict = field(default_factory=dict)
 
     def to_dict(self) -> dict:
@@ -224,11 +241,9 @@ def make_county_assessor(
     release1 = {
         "PARCEL_ID": parcel_ids,
         "LANDUSE": landuse,
-        "IMPR_VAL": [
-            None if v is None else int(round(v)) for v in _col(rows, "val_struct")
-        ],
+        "IMPR_VAL": [None if v is None else round(v) for v in _col(rows, "val_struct")],
         "LAND_VAL": [int(v) for v in rng.integers(20_000, 250_000, size=n)],
-        "FFE_IN": [None if h is None else int(round(h * 12)) for h in found_ht],
+        "FFE_IN": [None if h is None else round(h * 12) for h in found_ht],
         "FOUND": [_ASSESSOR_FOUNDATION.get(f) for f in _col(rows, "found_type")],
         "STORIES": _col(rows, "num_story"),
         "YR_BUILT": _col(rows, "med_yr_blt"),
@@ -245,7 +260,7 @@ def make_county_assessor(
     release2 = {k: list(v) for k, v in release1.items()}
     for i in edited_idx:
         if release2["IMPR_VAL"][i] is not None:
-            release2["IMPR_VAL"][i] = int(round(release2["IMPR_VAL"][i] * 1.08))
+            release2["IMPR_VAL"][i] = round(release2["IMPR_VAL"][i] * 1.08)
         ffe = release2["FFE_IN"][i]
         release2["FFE_IN"][i] = 6 if ffe is None else ffe + 6
     geoms2 = list(footprints)
@@ -253,8 +268,8 @@ def make_county_assessor(
     added_ids = [f"R{900_000 + k:07d}" for k in range(n_add)]
     offset_ft = 150.0
     for k, i in enumerate(source_idx):
-        for key in release2:
-            release2[key].append(release1[key][i])
+        for key, values in release2.items():
+            values.append(release1[key][i])
         release2["PARCEL_ID"][-1] = added_ids[k]
         release2["LANDUSE"][-1] = "A1"
         geoms2.append(
@@ -393,6 +408,130 @@ def make_project_riverbend(
     return lots
 
 
+# Milliman occupancy codes, keyed by NSI damage category.
+_MILLIMAN_OCCUPANCY = {
+    "RES": ("SFD", "CONDO"),
+    "COM": ("RETAIL", "OFFICE"),
+    "IND": ("WAREHOUSE",),
+}
+
+
+def make_milliman_portfolio(
+    nsi_path: str | Path,
+    out_dir: str | Path,
+    *,
+    county: str = SURVEY_COUNTY,
+    n: int = 60,
+    n_remove: int = 5,
+    n_renew: int = 10,
+    n_drop_deductible: int = 4,
+    n_add: int = 3,
+    seed: int = 41,
+) -> MillimanTruth:
+    """Write two releases of a commercial insurance portfolio as parquet.
+
+    Each location insures one NSI structure in `county` (lon / lat in
+    EPSG:4326 columns, LOC_ID ids) with its own occupancy codes, building
+    and contents replacement costs, and underwriting fields that have no
+    `buildings` column: POLICY_TERM, AGENT_ID, PREMIUM, COPE_CC (construction
+    class), DEDUCTIBLE_PCT (sometimes NULL), and INCEPTION_DATE. Release 2
+    lapses `n_remove` policies, renews `n_renew` at a 5 % higher premium,
+    drops the deductible of `n_drop_deductible` (NULL), and adds `n_add`
+    new locations.
+    """
+    import datetime as dt
+
+    out = Path(out_dir)
+    out.mkdir(parents=True, exist_ok=True)
+    rng = np.random.default_rng(seed)
+    rows = _nsi_rows(pq.read_table(str(nsi_path)), county)
+    rows = rows.filter(pc.is_valid(rows["val_struct"]))
+    rows = rows.take(np.sort(rng.choice(rows.num_rows, size=n, replace=False)))
+
+    loc_ids = [f"MLM-{i + 1:05d}" for i in rng.permutation(n)]
+    damcat = [d or "RES" for d in _col(rows, "st_damcat")]
+    occupancy = [
+        options[int(rng.integers(0, len(options)))]
+        for options in (_MILLIMAN_OCCUPANCY.get(d, ("RETAIL",)) for d in damcat)
+    ]
+    building = np.round(
+        np.array(_col(rows, "val_struct")) * rng.uniform(0.9, 1.3, n), -2
+    )
+    deductible = rng.choice([0.01, 0.02, 0.05], size=n).tolist()
+    for i in rng.choice(n, size=max(1, n // 5), replace=False):
+        deductible[i] = None
+    release1 = {
+        "LOC_ID": loc_ids,
+        "LON": _col(rows, "x"),
+        "LAT": _col(rows, "y"),
+        "OCCUPANCY": occupancy,
+        "BLDG_RPL_COST": building.tolist(),
+        "CONTENTS_RPL_COST": np.round(building * 0.5, -2).tolist(),
+        "YEAR_BUILT": _col(rows, "med_yr_blt"),
+        "NUM_STORIES": _col(rows, "num_story"),
+        "BLOCK_GEOID": _col(rows, "cbfips"),
+        "POLICY_TERM": rng.choice(["12M", "6M"], size=n, p=[0.8, 0.2]).tolist(),
+        "AGENT_ID": [f"AG-{a:03d}" for a in rng.integers(1, 40, size=n)],
+        "PREMIUM": np.round(building * 0.004 * rng.uniform(0.8, 1.2, n), 2).tolist(),
+        "COPE_CC": rng.integers(1, 7, size=n).tolist(),
+        "DEDUCTIBLE_PCT": deductible,
+        "INCEPTION_DATE": [
+            dt.date(2026, 1, 1) + dt.timedelta(days=int(d))
+            for d in rng.integers(0, 90, size=n)
+        ],
+    }
+    schema = pa.schema(
+        [
+            ("LOC_ID", pa.string()), ("LON", pa.float64()), ("LAT", pa.float64()),
+            ("OCCUPANCY", pa.string()), ("BLDG_RPL_COST", pa.float64()),
+            ("CONTENTS_RPL_COST", pa.float64()), ("YEAR_BUILT", pa.int32()),
+            ("NUM_STORIES", pa.int32()), ("BLOCK_GEOID", pa.string()),
+            ("POLICY_TERM", pa.string()), ("AGENT_ID", pa.string()),
+            ("PREMIUM", pa.float64()), ("COPE_CC", pa.int32()),
+            ("DEDUCTIBLE_PCT", pa.float64()), ("INCEPTION_DATE", pa.date32()),
+        ]
+    )  # fmt: skip
+    path1 = out / "milliman-2026q1-r1.parquet"
+    pq.write_table(pa.Table.from_pydict(release1, schema=schema), path1)
+
+    order = rng.permutation(n)
+    removed = np.sort(order[:n_remove])
+    renewed = np.sort(order[n_remove : n_remove + n_renew])
+    with_deductible = [
+        i
+        for i in order[n_remove + n_renew :]
+        if release1["DEDUCTIBLE_PCT"][i] is not None
+    ]
+    dropped = np.sort(with_deductible[:n_drop_deductible])
+    release2 = {k: list(v) for k, v in release1.items()}
+    for i in renewed:
+        release2["PREMIUM"][i] = round(release2["PREMIUM"][i] * 1.05, 2)
+    for i in dropped:
+        release2["DEDUCTIBLE_PCT"][i] = None
+    added = [f"MLM-{90_000 + k:05d}" for k in range(n_add)]
+    for k, i in enumerate(rng.choice(n, size=n_add, replace=False)):
+        for key, values in release2.items():
+            values.append(release1[key][i])
+        release2["LOC_ID"][-1] = added[k]
+        release2["LON"][-1] += 0.002
+        release2["LAT"][-1] += 0.002
+    keep = [i for i in range(n + n_add) if i not in set(removed)]
+    release2 = {k: [v[i] for i in keep] for k, v in release2.items()}
+    path2 = out / "milliman-2026q1-r2.parquet"
+    pq.write_table(pa.Table.from_pydict(release2, schema=schema), path2)
+
+    fd_ids = _col(rows, "fd_id")
+    return MillimanTruth(
+        release1=str(path1),
+        release2=str(path2),
+        nsi_fd_id={loc_ids[i]: int(fd_ids[i]) for i in range(n)},
+        removed=tuple(loc_ids[i] for i in removed),
+        renewed=tuple(loc_ids[i] for i in renewed),
+        deductible_dropped=tuple(loc_ids[i] for i in dropped),
+        added=tuple(added),
+    )
+
+
 def generate_all(
     nsi_path: str | Path,
     out_dir: str | Path,
@@ -409,6 +548,7 @@ def generate_all(
     survey = make_field_survey(nsi_path, survey_path, n=n_survey, seed=seed + 12)
     riverbend_path = out / "project-riverbend.parquet"
     lots = make_project_riverbend(nsi_path, riverbend_path, seed=seed + 20)
+    milliman = make_milliman_portfolio(nsi_path, out, seed=seed + 30)
     sources = SyntheticSources(
         out_dir=str(out),
         assessor=assessor,
@@ -417,6 +557,7 @@ def generate_all(
         riverbend=str(riverbend_path),
         riverbend_lots=lots,
         seed=seed,
+        milliman=milliman,
     )
     (out / "truth.json").write_text(json.dumps(sources.to_dict(), indent=2) + "\n")
     return sources
@@ -434,7 +575,8 @@ def main(argv: list[str] | None = None) -> int:
     print(
         f"OK: wrote {Path(sources.assessor.release1).name}, "
         f"{Path(sources.assessor.release2).name}, {Path(sources.survey).name}, "
-        f"{Path(sources.riverbend).name} and truth.json to {args.out}"
+        f"{Path(sources.riverbend).name}, {Path(sources.milliman.release1).name}, "
+        f"{Path(sources.milliman.release2).name} and truth.json to {args.out}"
     )
     return 0
 

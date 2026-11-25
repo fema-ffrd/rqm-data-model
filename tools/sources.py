@@ -31,15 +31,39 @@ unmapped fields are NULL. `x` / `y` (WGS84 lon / lat), when not mapped, are
 derived from the computation point. `expr` is executed by Spark SQL, so a
 spec is trusted configuration, like code.
 
+Source-native fields that have no `buildings` column can be carried through
+verbatim into `source_attributes` (one `MAP<STRING, STRING>` row per
+building; ADR-source-sidecar-attributes) with an optional `sidecar:` block:
+
+    sidecar:
+      fields:                            # output key -> rule
+        policy_term: {from: POLICY_TERM}
+        premium_usd: {from: PREMIUM, type: double}   # type is documentation
+        deductible_pct: DEDUCTIBLE_PCT               # shorthand for {from: ...}
+
+A sidecar rule is a plain passthrough: `from` plus an optional `type`
+(one of `SIDECAR_TYPES`, default `string`). Values are stored as
+`CAST(col AS STRING)`; readers cast back using the declared type, which is
+recorded in `sources.sidecar_schema`. A NULL input value drops the key from
+that building's map (present means the source had a value). Sidecar keys may
+not collide with a `buildings` column.
+
 `parse_spec` / `load_spec` validate a spec in pure Python, before Spark
 starts; `ingest_source` checks the input columns and ids at load time.
 `tools/sources/nsi.yaml` is the built-in NSI spec (identity mapping, native
 `fd_id` ids).
+
+Every spec is identified by `spec_sha256`, the SHA-256 of its canonical
+JSON document (`canonical_document`): cosmetic YAML changes (key order,
+whitespace, comments, quoting) keep the hash; any semantic change gives a
+new one. The canonical document is what `source_specs` stores.
 """
 
 from __future__ import annotations
 
+import datetime as _dt
 import hashlib
+import json
 import re
 from collections.abc import Mapping
 from dataclasses import dataclass, field
@@ -114,6 +138,16 @@ MAPPABLE_FIELDS: Mapping[str, str] = {
     "depindex": "float", "creprcnt": "float", "crerank": "float",
     "cbfips": "string", "x": "double", "y": "double",
 }  # fmt: skip
+# buildings columns a load computes rather than maps.
+COMPUTED_FIELDS: tuple[str, ...] = (
+    "building_id", "source_ref", "source_record_id", "ingested_at",
+)  # fmt: skip
+
+# Declared types of sidecar values (documentation; values are stored as text).
+SIDECAR_TYPES: tuple[str, ...] = (
+    "string", "double", "bigint", "boolean", "timestamp", "date",
+)  # fmt: skip
+SIDECAR_KEY_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,63}$")
 
 
 class SpecError(ValueError):
@@ -176,6 +210,15 @@ class IdSpec:
 
 
 @dataclass(frozen=True)
+class SidecarRule:
+    """One source-native field carried through into `source_attributes`."""
+
+    key: str  # output key in source_attributes.attributes
+    source: str  # YAML `from`: the input column
+    type: str = "string"  # declared type (documentation)
+
+
+@dataclass(frozen=True)
 class SourceSpec:
     """A validated source mapping spec (see the module docstring)."""
 
@@ -186,7 +229,10 @@ class SourceSpec:
     input: InputSpec
     id: IdSpec
     fields: tuple[FieldRule, ...]
-    sha256: str | None = None
+    sidecar: tuple[SidecarRule, ...] = ()
+    # SHA-256 of `document`, the canonical JSON of the spec (§ module doc).
+    sha256: str = ""
+    document: str = ""
     path: Path | None = None
     builtin: bool = False
 
@@ -199,11 +245,29 @@ class SourceSpec:
         return {rule.target: rule for rule in self.fields}
 
     @property
+    def sidecar_schema(self) -> dict[str, str] | None:
+        """Sidecar output key -> declared type, or None without a sidecar."""
+        return {r.key: r.type for r in self.sidecar} or None
+
+    @property
+    def spec_uri(self) -> str | None:
+        """Where the authored YAML lives: repo-relative inside the repository,
+        else the absolute path (None for specs parsed from data)."""
+        if self.path is None:
+            return None
+        path = self.path.resolve()
+        try:
+            return path.relative_to(HERE.parent).as_posix()
+        except ValueError:
+            return str(path)
+
+    @property
     def input_columns(self) -> set[str]:
         """Input columns the spec reads by name (checked at load time)."""
         cols = {self.id.column, *self.input.geometry.input_columns}
         for rule in self.fields:
             cols.update(rule.input_columns)
+        cols.update(rule.source for rule in self.sidecar)
         return cols
 
     @property
@@ -219,12 +283,47 @@ class SourceSpec:
 # ---------------------------------------------------------------------------
 
 _TOP_KEYS = {
-    "source_ref", "source_name", "source_kind", "description", "input", "id", "fields",
+    "source_ref", "source_name", "source_kind", "description", "input", "id",
+    "fields", "sidecar",
 }  # fmt: skip
 _INPUT_KEYS = {"format", "layer", "crs", "geometry", "options"}
 _GEOMETRY_KEYS = {"kind", "column", "lon", "lat", "subcode"}
 _ID_KEYS = {"column", "scheme"}
 _RULE_KEYS = {"from", "expr", "map", "default"}
+_SIDECAR_KEYS = {"fields"}
+_SIDECAR_RULE_KEYS = {"from", "type"}
+
+
+# ---------------------------------------------------------------------------
+# Canonical form and hash
+# ---------------------------------------------------------------------------
+
+
+def _canonical(value: Any) -> Any:
+    """`value` as plain JSON data: string map keys, lists for sequences."""
+    if isinstance(value, Mapping):
+        return {str(k): _canonical(v) for k, v in value.items()}
+    if isinstance(value, list | tuple):
+        return [_canonical(v) for v in value]
+    if isinstance(value, _dt.date | _dt.datetime):
+        return value.isoformat()
+    return value
+
+
+def canonical_document(data: Any) -> str:
+    """Canonical JSON of a parsed spec: keys sorted recursively, compact
+    separators, UTF-8 text, no trailing newline. `spec_sha256` is the
+    SHA-256 of these bytes, so reordering keys or reformatting the YAML keeps
+    the hash, and any changed value changes it.
+    """
+    return json.dumps(
+        _canonical(data), sort_keys=True, separators=(",", ":"), ensure_ascii=False
+    )
+
+
+def spec_sha256(document: str) -> str:
+    """SHA-256 (hex) of a canonical spec document."""
+    return hashlib.sha256(document.encode("utf-8")).hexdigest()
 
 
 def valid_code(target: str, code: Any) -> bool:
@@ -343,14 +442,69 @@ def _parse_geometry(raw: Any, fmt: Any, problems: list[str]) -> GeometrySpec | N
     return GeometrySpec(kind, column, lon, lat, subcode)
 
 
+def _parse_sidecar(
+    raw: Any, field_targets: set[str], problems: list[str]
+) -> tuple[SidecarRule, ...]:
+    """Parse the optional `sidecar:` block (see the module docstring)."""
+    if not isinstance(raw, Mapping):
+        problems.append("sidecar: must be a mapping {fields: {key: rule}}")
+        return ()
+    _unknown_keys(raw, _SIDECAR_KEYS, "sidecar", problems)
+    raw_fields = raw.get("fields")
+    if not isinstance(raw_fields, Mapping) or not raw_fields:
+        problems.append(
+            "sidecar.fields: required non-empty mapping of output key -> rule "
+            "(remove the sidecar block to carry no extra fields)"
+        )
+        return ()
+    reserved = {c.lower() for c in (*MAPPABLE_FIELDS, *COMPUTED_FIELDS)}
+    rules: list[SidecarRule] = []
+    for key, rule in raw_fields.items():
+        key = str(key)
+        where = f"sidecar.fields.{key}"
+        if not SIDECAR_KEY_RE.match(key):
+            problems.append(
+                f"{where}: key must match {SIDECAR_KEY_RE.pattern} "
+                "(letters, digits, '_')"
+            )
+            continue
+        if key in field_targets:
+            problems.append(f"{where}: {key!r} is already mapped in fields")
+        elif key.lower() in reserved:
+            problems.append(
+                f"{where}: {key!r} is a buildings column; map it in fields instead"
+            )
+        if isinstance(rule, str):
+            rule = {"from": rule}
+        if not isinstance(rule, Mapping):
+            problems.append(
+                f"{where}: expected a column name or {{from, type}}, got {rule!r}"
+            )
+            continue
+        _unknown_keys(rule, _SIDECAR_RULE_KEYS, where, problems)
+        source = _str(rule.get("from"))
+        if source is None:
+            problems.append(f"{where}: 'from' (the input column) is required")
+        dtype = rule.get("type", "string")
+        if dtype not in SIDECAR_TYPES:
+            problems.append(
+                f"{where}: type {dtype!r} is not one of {', '.join(SIDECAR_TYPES)}"
+            )
+        if source is not None:
+            rules.append(SidecarRule(key, source, dtype))
+    return tuple(rules)
+
+
 def parse_spec(
     data: Any,
     *,
-    sha256: str | None = None,
     path: Path | None = None,
     builtin: bool = False,
 ) -> SourceSpec:
-    """Validate a spec given as parsed YAML; raise `SpecError` listing every problem."""
+    """Validate a spec given as parsed YAML; raise `SpecError` listing every problem.
+
+    The returned spec carries its canonical document and `sha256`.
+    """
     problems: list[str] = []
     where = f"source spec {path}" if path else "source spec"
     if not isinstance(data, Mapping):
@@ -454,8 +608,14 @@ def parse_spec(
         if ("x" in targets) != ("y" in targets):
             problems.append("fields: map both x and y (WGS84 lon / lat) or neither")
 
+    sidecar: tuple[SidecarRule, ...] = ()
+    if data.get("sidecar") is not None:
+        mapped = set(raw_fields) if isinstance(raw_fields, Mapping) else set()
+        sidecar = _parse_sidecar(data["sidecar"], set(map(str, mapped)), problems)
+
     if problems:
         raise SpecError(problems, where)
+    document = canonical_document(data)
     return SourceSpec(
         source_ref=source_ref,
         source_name=source_name,
@@ -464,23 +624,23 @@ def parse_spec(
         input=input_spec,
         id=id_spec,
         fields=tuple(rules),
-        sha256=sha256,
+        sidecar=sidecar,
+        sha256=spec_sha256(document),
+        document=document,
         path=path,
         builtin=builtin,
     )
 
 
 def load_spec(path: str | Path, *, builtin: bool = False) -> SourceSpec:
-    """Read and validate a YAML spec file; `sha256` is the file's hash."""
+    """Read and validate a YAML spec file (`sha256` is its canonical hash)."""
     path = Path(path)
     raw = path.read_bytes()
     try:
         data = yaml.safe_load(raw)
     except yaml.YAMLError as err:
         raise SpecError([f"not valid YAML: {err}"], f"source spec {path}") from err
-    return parse_spec(
-        data, sha256=hashlib.sha256(raw).hexdigest(), path=path, builtin=builtin
-    )
+    return parse_spec(data, path=path, builtin=builtin)
 
 
 @cache

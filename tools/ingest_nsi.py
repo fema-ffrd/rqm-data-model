@@ -731,6 +731,14 @@ DEFAULT_LAYOUTS: Mapping[str, TableLayout] = {
         partition_by=("truncate(2, cbfips)",), write_order=("cbfips",)
     ),
     "geometries": TableLayout(),
+    # Scoped loads replace one source's rows, so each source keeps its own
+    # files; building_id order clusters the MERGE join key.
+    "source_attributes": TableLayout(
+        partition_by=("source_ref",), write_order=("building_id",)
+    ),
+    "building_lineage": TableLayout(
+        partition_by=("source_ref",), write_order=("building_id",)
+    ),
 }
 
 
@@ -937,8 +945,13 @@ def apply_schema(
     Existing tables are migrated idempotently: columns the DDL declares but
     the table lacks are added (`migrate_table`). When `buildings` gains
     `source_ref`, its existing rows are NSI rows, so the built-in NSI source
-    is registered in `sources` for them to resolve. Returns the added
-    columns per migrated table.
+    is registered in `sources` for them to resolve. The versioned sidecar
+    tables (`source_attributes`, `building_lineage`) are then given an empty
+    root snapshot, every branch `buildings` has, and a tag for every
+    registered version; when `building_lineage` is created in a populated
+    warehouse, the lineage of NSI buildings is backfilled
+    (`versioning.prepare_sidecar_tables`). Returns the added columns per
+    migrated table.
 
     Spark SQL accepts one statement per `spark.sql(...)` call, so the script
     is split with `split_sql_statements`.
@@ -954,6 +967,7 @@ def apply_schema(
         raise ValueError(f"layouts given for tables not in schema.sql: {unknown}")
 
     migrated: dict[str, list[str]] = {}
+    created: set[str] = set()
     for statement in statements:
         table = created_table(statement)
         if table is None:
@@ -962,6 +976,7 @@ def apply_schema(
             layout = layouts.get(table.split(".")[-1], TableLayout())
             for sql in layout_sql(statement, layout):
                 spark.sql(sql)
+            created.add(table.split(".")[-1])
         elif added := migrate_table(spark, statement):
             migrated[table.split(".")[-1]] = added
 
@@ -970,6 +985,10 @@ def apply_schema(
         from sources import nsi_spec
 
         register_source(spark, nsi_spec(), catalog, namespace)
+
+    from versioning import prepare_sidecar_tables
+
+    prepare_sidecar_tables(spark, catalog, namespace, created=created)
     return migrated
 
 
@@ -1045,6 +1064,7 @@ def load_buildings(
     catalog: str,
     namespace: str = NAMESPACE,
     branch: str | None = None,
+    version: str | None = None,
 ) -> int:
     """Upsert an NSI parquet into `buildings` as a full replacement of NSI.
 
@@ -1054,18 +1074,35 @@ def load_buildings(
     rows are left alone, and NSI buildings missing from the parquet are
     deleted from the branch head. Buildings of other sources are never
     touched. Tagged versions keep the deleted rows. Also registers the NSI
-    source in `sources`.
+    source and spec (`sources`, `source_specs`) and writes the NSI rows of
+    `source_attributes` and `building_lineage`; `version` is the version the
+    load will be committed as (recorded in the lineage of the buildings it
+    changed; else filled in by the next `commit_version`).
 
     Delegates to the generic engine (`ingest_source`) with the built-in spec
     `tools/sources/nsi.yaml`. Returns the NSI row count at the branch head.
     """
-    from ingest_source import merge_buildings, register_source
+    from ingest_source import (
+        buildings_snapshot,
+        merge_building_lineage,
+        merge_buildings,
+        merge_source_attributes,
+        register_source,
+        register_spec,
+    )
     from sources import nsi_spec
 
     spec = nsi_spec()
     require_branch(spark, catalog, branch, namespace)
+    register_spec(spark, spec, catalog, namespace)
     register_source(spark, spec, catalog, namespace)
-    return merge_buildings(spark, spec, parquet_path, catalog, namespace, branch)
+    before = buildings_snapshot(spark, catalog, namespace, branch)
+    n = merge_buildings(spark, spec, parquet_path, catalog, namespace, branch)
+    merge_source_attributes(spark, spec, parquet_path, catalog, namespace, branch)
+    merge_building_lineage(
+        spark, spec, catalog, namespace, branch, version, since=before
+    )
+    return n
 
 
 def load_geometries(
@@ -1318,7 +1355,9 @@ def main() -> int:
 
             # Fail before touching the tables rather than after the load.
             ensure_version_available(spark, cat, args.version, ns)
-        n_buildings = load_buildings(spark, args.parquet, cat, ns, branch)
+        n_buildings = load_buildings(
+            spark, args.parquet, cat, ns, branch, version=args.version
+        )
         n_geoms = load_geometries(spark, args.parquet, cat, ns, branch)
         parquet_rows = pq.ParquetFile(str(args.parquet)).metadata.num_rows
         print(
