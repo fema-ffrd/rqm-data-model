@@ -1,0 +1,40 @@
+# Demo source spec: a commercial insurance portfolio (synthetic;
+# tools/synthetic_sources.py make_milliman_portfolio).
+# Parquet with lon / lat columns, its own occupancy codes and LOC_ID ids, and
+# underwriting fields that have no buildings column: they are carried
+# through verbatim into source_attributes by the sidecar block
+# (ADR-source-sidecar-attributes).
+source_ref: MILLIMAN-2026Q1
+source_name: Milliman Commercial Portfolio 2026 Q1
+source_kind: commercial_inventory
+description: >
+  Synthetic insured-location schedule: one location per insured structure
+  with occupancy, building and contents replacement cost, and policy
+  underwriting fields (term, agent, premium, COPE construction class,
+  deductible, inception date).
+input:
+  format: parquet
+  crs: EPSG:4326
+  geometry: {kind: point, lon: LON, lat: LAT}
+id: {column: LOC_ID}
+fields:
+  occtype:
+    from: OCCUPANCY
+    map: {SFD: RES1, CONDO: RES3C, RETAIL: COM1, OFFICE: COM4, WAREHOUSE: IND2}
+    default: COM1
+  st_damcat:
+    from: OCCUPANCY
+    map: {SFD: RES, CONDO: RES, RETAIL: COM, OFFICE: COM, WAREHOUSE: IND}
+  val_struct: {from: BLDG_RPL_COST}
+  val_cont: {from: CONTENTS_RPL_COST}
+  med_yr_blt: YEAR_BUILT
+  num_story: NUM_STORIES
+  cbfips: BLOCK_GEOID
+sidecar:
+  fields:
+    policy_term: {from: POLICY_TERM}
+    agent_id: {from: AGENT_ID}
+    premium_usd: {from: PREMIUM, type: double}
+    cope_construction: {from: COPE_CC, type: bigint}
+    deductible_pct: {from: DEDUCTIBLE_PCT, type: double}
+    inception_date: {from: INCEPTION_DATE, type: date}

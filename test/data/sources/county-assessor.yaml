@@ -1,0 +1,33 @@
+# Demo source spec: a county assessor roll (synthetic; tools/synthetic_sources.py).
+# GeoPackage parcel footprints in Texas North Central state plane (US feet),
+# with its own column names, land-use codes, units, and parcel ids.
+source_ref: COUNTY-ASSESSOR
+source_name: Example County Assessor Parcels
+source_kind: local_inventory
+description: >
+  Synthetic county appraisal-district roll: one parcel per improved
+  structure with land-use code, improvement value, first-floor elevation
+  above grade in inches, and foundation type. Footprints become display
+  geometries; the computation point is their point on surface.
+input:
+  format: gpkg
+  layer: parcels
+  crs: EPSG:2276
+  geometry: {kind: polygon, column: geom}
+id: {column: PARCEL_ID}
+fields:
+  # Land-use code -> occupancy crosswalk (lossy); unknown codes get RES1.
+  occtype:
+    from: LANDUSE
+    map: {A1: RES1, A2: RES2, B1: RES3C, B2: RES3A, F1: COM1, F2: IND2, D2: AGR1, XG: GOV1, XC: REL1, XS: EDU1}
+    default: RES1
+  st_damcat:
+    from: LANDUSE
+    map: {A1: RES, A2: RES, B1: RES, B2: RES, F1: COM, F2: IND, D2: AGR, XG: PUB, XC: PUB, XS: PUB}
+  val_struct: {expr: "IMPR_VAL * 1.0"}
+  found_ht: {expr: "FFE_IN / 12.0"}            # inches -> feet
+  found_type: {from: FOUND, map: {SLAB: S, CRAWL: C, BASEMENT: B, PIER: P}}
+  num_story: STORIES
+  med_yr_blt: YR_BUILT
+  sqft: LIVING_SQFT
+  cbfips: BLOCK_GEOID
